@@ -9,12 +9,13 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"sync"
 
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/modules/validation"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/validation"
 
 	"github.com/hashicorp/go-version"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v4"
 )
 
 var (
@@ -24,7 +25,9 @@ var (
 	ErrInvalidVersion      = util.NewInvalidArgumentErrorf("package version is invalid")
 )
 
-var namePattern = regexp.MustCompile(`\A[a-zA-Z_][a-zA-Z0-9_]*\z`)
+var namePattern = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`\A[a-zA-Z_][a-zA-Z0-9_]*\z`)
+})
 
 // https://github.com/dart-lang/pub-dev/blob/4d582302a8d10152a5cd6129f65bf4f4dbca239d/pkg/pub_package_reader/lib/pub_package_reader.dart#L143
 const maxPubspecFileSize = 128 * 1024
@@ -38,12 +41,12 @@ type Package struct {
 
 // Metadata represents the metadata of a Pub package
 type Metadata struct {
-	Description      string      `json:"description,omitempty"`
-	ProjectURL       string      `json:"project_url,omitempty"`
-	RepositoryURL    string      `json:"repository_url,omitempty"`
-	DocumentationURL string      `json:"documentation_url,omitempty"`
-	Readme           string      `json:"readme,omitempty"`
-	Pubspec          interface{} `json:"pubspec"`
+	Description      string `json:"description,omitempty"`
+	ProjectURL       string `json:"project_url,omitempty"`
+	RepositoryURL    string `json:"repository_url,omitempty"`
+	DocumentationURL string `json:"documentation_url,omitempty"`
+	Readme           string `json:"readme,omitempty"`
+	Pubspec          any    `json:"pubspec"`
 }
 
 type pubspecPackage struct {
@@ -88,8 +91,8 @@ func ParsePackage(r io.Reader) (*Package, error) {
 			if err != nil {
 				return nil, err
 			}
-		} else if strings.ToLower(hd.Name) == "readme.md" {
-			data, err := io.ReadAll(tr)
+		} else if strings.EqualFold(hd.Name, "readme.md") {
+			data, err := util.ReadWithLimit(tr, 1024*1024)
 			if err != nil {
 				return nil, err
 			}
@@ -118,7 +121,7 @@ func ParsePubspecMetadata(r io.Reader) (*Package, error) {
 		return nil, err
 	}
 
-	if !namePattern.MatchString(p.Name) {
+	if !namePattern().MatchString(p.Name) {
 		return nil, ErrInvalidName
 	}
 
@@ -134,7 +137,7 @@ func ParsePubspecMetadata(r io.Reader) (*Package, error) {
 		p.Repository = ""
 	}
 
-	var pubspec interface{}
+	var pubspec any
 	if err := yaml.Unmarshal(buf, &pubspec); err != nil {
 		return nil, err
 	}

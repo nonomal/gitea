@@ -8,31 +8,35 @@ import (
 	"fmt"
 	"net/http"
 
-	"code.gitea.io/gitea/modules/log"
+	pingv1 "gitea.dev/actionslib/ping/v1"
+	"gitea.dev/actionslib/ping/v1/pingv1connect"
+	"gitea.dev/modules/log"
 
-	pingv1 "code.gitea.io/actions-proto-go/ping/v1"
-	"code.gitea.io/actions-proto-go/ping/v1/pingv1connect"
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connecthttp"
 )
 
 func NewPingServiceHandler() (string, http.Handler) {
-	return pingv1connect.NewPingServiceHandler(&Service{})
+	server := connect.NewServer()
+	pingv1connect.RegisterPingServiceHandler(server, &Service{})
+	mux := http.NewServeMux()
+	connecthttp.Mount(mux, server)
+	return "/" + pingv1connect.PingServiceName + "/", mux
 }
 
 var _ pingv1connect.PingServiceHandler = (*Service)(nil)
 
-type Service struct {
-	pingv1connect.UnimplementedPingServiceHandler
-}
+type Service struct{}
 
 func (s *Service) Ping(
 	ctx context.Context,
-	req *connect.Request[pingv1.PingRequest],
-) (*connect.Response[pingv1.PingResponse], error) {
-	log.Trace("Content-Type: %s", req.Header().Get("Content-Type"))
-	log.Trace("User-Agent: %s", req.Header().Get("User-Agent"))
-	res := connect.NewResponse(&pingv1.PingResponse{
-		Data: fmt.Sprintf("Hello, %s!", req.Msg.Data),
-	})
+	req *pingv1.PingRequest,
+) (*pingv1.PingResponse, error) {
+	info, _ := connect.CallInfoForServerContext(ctx)
+	log.Trace("Content-Type: %s", info.RequestHeader().Get("Content-Type"))
+	log.Trace("User-Agent: %s", info.RequestHeader().Get("User-Agent"))
+	res := &pingv1.PingResponse{
+		Data: fmt.Sprintf("Hello, %s!", req.Data),
+	}
 	return res, nil
 }

@@ -7,24 +7,23 @@ import (
 	"bytes"
 	"net/http"
 
-	"code.gitea.io/gitea/models/db"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/sitemap"
-	"code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/sitemap"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/context"
 )
 
 const (
 	// tplExploreUsers explore users page template
-	tplExploreUsers base.TplName = "explore/users"
+	tplExploreUsers templates.TplName = "explore/users"
 )
-
-// UserSearchDefaultSortType is the default sort type for user search
-const UserSearchDefaultSortType = "alphabetically"
 
 var nullByte = []byte{0x00}
 
@@ -33,10 +32,10 @@ func isKeywordValid(keyword string) bool {
 }
 
 // RenderUserSearch render user search page
-func RenderUserSearch(ctx *context.Context, opts *user_model.SearchUserOptions, tplName base.TplName) {
+func RenderUserSearch(ctx *context.Context, opts user_model.SearchUserOptions, tplName templates.TplName) {
 	// Sitemap index for sitemap paths
-	opts.Page = int(ctx.ParamsInt64("idx"))
-	isSitemap := ctx.Params("idx") != ""
+	opts.Page = ctx.PathParamInt("idx")
+	isSitemap := ctx.PathParam("idx") != ""
 	if opts.Page <= 1 {
 		opts.Page = ctx.FormInt("page")
 	}
@@ -56,14 +55,14 @@ func RenderUserSearch(ctx *context.Context, opts *user_model.SearchUserOptions, 
 	)
 
 	// we can not set orderBy to `models.SearchOrderByXxx`, because there may be a JOIN in the statement, different tables may have the same name columns
-	ctx.Data["SortType"] = ctx.FormString("sort")
-	switch ctx.FormString("sort") {
+	sortOrder := util.IfZero(string(opts.OrderBy), ctx.FormString("sort", setting.UI.ExploreDefaultSort))
+	ctx.Data["SortType"] = sortOrder
+
+	switch sortOrder {
 	case "newest":
 		orderBy = "`user`.id DESC"
 	case "oldest":
 		orderBy = "`user`.id ASC"
-	case "recentupdate":
-		orderBy = "`user`.updated_unix DESC"
 	case "leastupdate":
 		orderBy = "`user`.updated_unix ASC"
 	case "reversealphabetically":
@@ -72,25 +71,35 @@ func RenderUserSearch(ctx *context.Context, opts *user_model.SearchUserOptions, 
 		orderBy = "`user`.last_login_unix ASC"
 	case "reverselastlogin":
 		orderBy = "`user`.last_login_unix DESC"
-	case UserSearchDefaultSortType: // "alphabetically"
-	default:
+	case "alphabetically":
 		orderBy = "`user`.name ASC"
-		ctx.Data["SortType"] = UserSearchDefaultSortType
+	case "recentupdate":
+		fallthrough
+	default:
+		// in case the sortType is not valid, we set it to recentupdate
+		sortOrder = "recentupdate"
+		ctx.Data["SortType"] = "recentupdate"
+		orderBy = "`user`.updated_unix DESC"
+	}
+
+	if opts.SupportedSortOrders != nil && !opts.SupportedSortOrders.Contains(sortOrder) {
+		ctx.NotFound()
+		return
 	}
 
 	opts.Keyword = ctx.FormTrim("q")
 	opts.OrderBy = orderBy
 	if len(opts.Keyword) == 0 || isKeywordValid(opts.Keyword) {
-		users, count, err = user_model.SearchUsers(opts)
+		users, count, err = user_model.SearchUsers(ctx, opts)
 		if err != nil {
-			ctx.ServerError("SearchUsers", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 	}
 	if isSitemap {
 		m := sitemap.NewSitemap()
 		for _, item := range users {
-			m.Add(sitemap.URL{URL: item.HTMLURL(), LastMod: item.UpdatedUnix.AsTimePtr()})
+			m.Add(sitemap.URL{URL: item.HTMLURL(ctx), LastMod: item.UpdatedUnix.AsTimePtr()})
 		}
 		ctx.Resp.Header().Set("Content-Type", "text/xml")
 		if _, err := m.WriteTo(ctx.Resp); err != nil {
@@ -102,15 +111,11 @@ func RenderUserSearch(ctx *context.Context, opts *user_model.SearchUserOptions, 
 	ctx.Data["Keyword"] = opts.Keyword
 	ctx.Data["Total"] = count
 	ctx.Data["Users"] = users
-	ctx.Data["UsersTwoFaStatus"] = user_model.UserList(users).GetTwoFaStatus()
+	ctx.Data["UsersTwoFaStatus"] = user_model.UserList(users).GetTwoFaStatus(ctx)
 	ctx.Data["ShowUserEmail"] = setting.UI.ShowUserEmail
 	ctx.Data["IsRepoIndexerEnabled"] = setting.Indexer.RepoIndexerEnabled
 
-	pager := context.NewPagination(int(count), opts.PageSize, opts.Page, 5)
-	pager.SetDefaultParams(ctx)
-	for paramKey, paramVal := range opts.ExtraParamStrings {
-		pager.AddParamString(paramKey, paramVal)
-	}
+	pager := context.NewPagerBuilder(ctx).TotalCount(count).PerPageLimit(opts.PageSize).CurPage(opts.Page).Build()
 	ctx.Data["Page"] = pager
 
 	ctx.HTML(http.StatusOK, tplName)
@@ -119,19 +124,32 @@ func RenderUserSearch(ctx *context.Context, opts *user_model.SearchUserOptions, 
 // Users render explore users page
 func Users(ctx *context.Context) {
 	if setting.Service.Explore.DisableUsersPage {
-		ctx.Redirect(setting.AppSubURL + "/explore/repos")
+		ctx.Redirect(setting.AppSubURL + "/explore")
 		return
 	}
-	ctx.Data["Title"] = ctx.Tr("explore")
+	ctx.Data["OrganizationsPageIsDisabled"] = setting.Service.Explore.DisableOrganizationsPage
+	ctx.Data["CodePageIsDisabled"] = setting.Service.Explore.DisableCodePage
+	ctx.Data["Title"] = ctx.Tr("explore_title")
 	ctx.Data["PageIsExplore"] = true
 	ctx.Data["PageIsExploreUsers"] = true
 	ctx.Data["IsRepoIndexerEnabled"] = setting.Indexer.RepoIndexerEnabled
 
-	RenderUserSearch(ctx, &user_model.SearchUserOptions{
+	supportedSortOrders := container.SetOf(
+		"newest",
+		"oldest",
+		"alphabetically",
+		"reversealphabetically",
+	)
+	sortOrderDefault := util.Iif(supportedSortOrders.Contains(setting.UI.ExploreDefaultSort), setting.UI.ExploreDefaultSort, "newest")
+	sortOrder := ctx.FormString("sort", sortOrderDefault)
+	RenderUserSearch(ctx, user_model.SearchUserOptions{
 		Actor:       ctx.Doer,
-		Type:        user_model.UserTypeIndividual,
+		Types:       []user_model.UserType{user_model.UserTypeIndividual},
 		ListOptions: db.ListOptions{PageSize: setting.UI.ExplorePagingNum},
-		IsActive:    util.OptionalBoolTrue,
+		IsActive:    optional.Some(true),
 		Visible:     []structs.VisibleType{structs.VisibleTypePublic, structs.VisibleTypeLimited, structs.VisibleTypePrivate},
+		OrderBy:     db.SearchOrderBy(sortOrder),
+
+		SupportedSortOrders: supportedSortOrders,
 	}, tplExploreUsers)
 }

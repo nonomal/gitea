@@ -6,16 +6,16 @@ package auth
 import (
 	"context"
 
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/log"
+	"gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/log"
 )
 
 // SyncExternalUsers is used to synchronize users with external authorization source
 func SyncExternalUsers(ctx context.Context, updateExisting bool) error {
 	log.Trace("Doing: SyncExternalUsers")
 
-	ls, err := auth.Sources()
+	ls, err := db.Find[auth.Source](ctx, auth.FindSourcesOptions{})
 	if err != nil {
 		log.Error("SyncExternalUsers: %v", err)
 		return err

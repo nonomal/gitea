@@ -8,9 +8,11 @@ import (
 	"errors"
 	"io"
 	"regexp"
+	"sync"
 
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/validation"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/packages"
+	"gitea.dev/modules/validation"
 
 	"github.com/hashicorp/go-version"
 )
@@ -59,13 +61,18 @@ type Dependency struct {
 	Package         *string  `json:"package"`
 }
 
-var nameMatch = regexp.MustCompile(`\A[a-zA-Z][a-zA-Z0-9-_]{0,63}\z`)
+var nameMatch = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`\A[a-zA-Z][a-zA-Z0-9-_]{0,63}\z`)
+})
 
 // ParsePackage reads the metadata and content of a package
 func ParsePackage(r io.Reader) (*Package, error) {
 	var size uint32
 	if err := binary.Read(r, binary.LittleEndian, &size); err != nil {
 		return nil, err
+	}
+	if size > packages.MaxMetadataSize {
+		return nil, packages.ErrContentTooLarge
 	}
 
 	p, err := parsePackage(io.LimitReader(r, int64(size)))
@@ -116,7 +123,7 @@ func parsePackage(r io.Reader) (*Package, error) {
 		return nil, err
 	}
 
-	if !nameMatch.MatchString(meta.Name) {
+	if !nameMatch().MatchString(meta.Name) {
 		return nil, ErrInvalidName
 	}
 
@@ -136,8 +143,16 @@ func parsePackage(r io.Reader) (*Package, error) {
 
 	dependencies := make([]*Dependency, 0, len(meta.Deps))
 	for _, dep := range meta.Deps {
+		// https://doc.rust-lang.org/cargo/reference/registry-web-api.html#publish
+		// It is a string of the new package name if the dependency is renamed, otherwise empty
+		name := dep.ExplicitNameInToml
+		pkg := &dep.Name
+		if name == "" {
+			name = dep.Name
+			pkg = nil
+		}
 		dependencies = append(dependencies, &Dependency{
-			Name:            dep.Name,
+			Name:            name,
 			Req:             dep.VersionReq,
 			Features:        dep.Features,
 			Optional:        dep.Optional,
@@ -145,6 +160,7 @@ func parsePackage(r io.Reader) (*Package, error) {
 			Target:          dep.Target,
 			Kind:            dep.Kind,
 			Registry:        dep.Registry,
+			Package:         pkg,
 		})
 	}
 

@@ -11,9 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/markup"
-	"code.gitea.io/gitea/modules/translation"
+	"gitea.dev/modules/markup"
+	"gitea.dev/modules/translation"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -95,15 +94,33 @@ j, ,\x20
 			},
 			expectedDelimiter: ',',
 		},
+		// case 3 - every delimiter used, default to comma and handle differing number of fields per record
+		{
+			csv: `col1,col2
+a;b
+c@e
+f	g
+h|i
+jkl`,
+			expectedRows: [][]string{
+				{"col1", "col2"},
+				{"a;b"},
+				{"c@e"},
+				{"f	g"},
+				{"h|i"},
+				{"jkl"},
+			},
+			expectedDelimiter: ',',
+		},
 	}
 
 	for n, c := range cases {
 		rd, err := CreateReaderAndDetermineDelimiter(nil, strings.NewReader(decodeSlashes(t, c.csv)))
 		assert.NoError(t, err, "case %d: should not throw error: %v\n", n, err)
-		assert.EqualValues(t, c.expectedDelimiter, rd.Comma, "case %d: delimiter should be '%c', got '%c'", n, c.expectedDelimiter, rd.Comma)
+		assert.Equal(t, c.expectedDelimiter, rd.Comma, "case %d: delimiter should be '%c', got '%c'", n, c.expectedDelimiter, rd.Comma)
 		rows, err := rd.ReadAll()
 		assert.NoError(t, err, "case %d: should not throw error: %v\n", n, err)
-		assert.EqualValues(t, c.expectedRows, rows, "case %d: rows should be equal", n)
+		assert.Equal(t, c.expectedRows, rows, "case %d: rows should be equal", n)
 	}
 }
 
@@ -118,21 +135,6 @@ func TestDetermineDelimiterShortBufferError(t *testing.T) {
 	assert.Error(t, err, "CreateReaderAndDetermineDelimiter() should throw an error")
 	assert.ErrorIs(t, err, io.ErrShortBuffer)
 	assert.Nil(t, rd, "CSV reader should be mnil")
-}
-
-func TestDetermineDelimiterReadAllError(t *testing.T) {
-	rd, err := CreateReaderAndDetermineDelimiter(nil, strings.NewReader(`col1,col2
-	a;b
-	c@e
-	f	g
-	h|i
-	jkl`))
-	assert.NoError(t, err, "CreateReaderAndDetermineDelimiter() shouldn't throw error")
-	assert.NotNil(t, rd, "CSV reader should not be mnil")
-	rows, err := rd.ReadAll()
-	assert.Error(t, err, "RaadAll() should throw error")
-	assert.ErrorIs(t, err, csv.ErrFieldCount)
-	assert.Empty(t, rows, "rows should be empty")
 }
 
 func TestDetermineDelimiter(t *testing.T) {
@@ -231,11 +233,8 @@ John Doe	john@doe.com	This,note,had,a,lot,of,commas,to,test,delimiters`,
 	}
 
 	for n, c := range cases {
-		delimiter := determineDelimiter(&markup.RenderContext{
-			Ctx:          git.DefaultContext,
-			RelativePath: c.filename,
-		}, []byte(decodeSlashes(t, c.csv)))
-		assert.EqualValues(t, c.expectedDelimiter, delimiter, "case %d: delimiter should be equal, expected '%c' got '%c'", n, c.expectedDelimiter, delimiter)
+		delimiter := determineDelimiter(markup.NewRenderContext(t.Context()).WithRelativePath(c.filename), []byte(decodeSlashes(t, c.csv)))
+		assert.Equal(t, c.expectedDelimiter, delimiter, "case %d: delimiter should be equal, expected '%c' got '%c'", n, c.expectedDelimiter, delimiter)
 	}
 }
 
@@ -300,7 +299,7 @@ abc   | |123
 
 	for n, c := range cases {
 		modifiedText := removeQuotedString(decodeSlashes(t, c.text))
-		assert.EqualValues(t, c.expectedText, modifiedText, "case %d: modified text should be equal", n)
+		assert.Equal(t, c.expectedText, modifiedText, "case %d: modified text should be equal", n)
 	}
 }
 
@@ -308,6 +307,7 @@ func TestGuessDelimiter(t *testing.T) {
 	cases := []struct {
 		csv               string
 		expectedDelimiter rune
+		checkQuotes       bool
 	}{
 		// case 0 - single cell, comma delmited
 		{
@@ -374,12 +374,14 @@ quoted,
 quoted,
 text,"	d`,
 			expectedDelimiter: '\t',
+			checkQuotes:       true,
 		},
 		// case 10 - semicolon delmited with quotes and semicolon in value
 		{
 			csv: `col1;col2
 "this has a literal "" in the text";"and an ; in the text"`,
 			expectedDelimiter: ';',
+			checkQuotes:       true,
 		},
 		// case 11 - pipe delimited with quotes
 		{
@@ -390,6 +392,7 @@ World"|123
 |
 f" | 4.56 | 789`,
 			expectedDelimiter: '|',
+			checkQuotes:       true,
 		},
 		// case 12 - a tab delimited 6 column CSV, but the values are not quoted and have lots of commas.
 		// In the previous bestScore algorithm, this would have picked comma as the delimiter, but now it should guess tab
@@ -455,7 +458,11 @@ jkl`,
 
 	for n, c := range cases {
 		delimiter := guessDelimiter([]byte(decodeSlashes(t, c.csv)))
-		assert.EqualValues(t, c.expectedDelimiter, delimiter, "case %d: delimiter should be equal, expected '%c' got '%c'", n, c.expectedDelimiter, delimiter)
+		assert.Equal(t, c.expectedDelimiter, delimiter, "case %d: delimiter should be equal, expected '%c' got '%c'", n, c.expectedDelimiter, delimiter)
+		if c.checkQuotes {
+			delimiter = guessFromBeforeAfterQuotes([]byte(decodeSlashes(t, c.csv)))
+			assert.Equal(t, c.expectedDelimiter, delimiter, "case %d: delimiter should be equal, expected '%c' got '%c'", n, c.expectedDelimiter, delimiter)
+		}
 	}
 }
 
@@ -464,39 +471,6 @@ func TestGuessFromBeforeAfterQuotes(t *testing.T) {
 		csv               string
 		expectedDelimiter rune
 	}{
-		// case 0 - tab delimited with new lines in values, commas in values
-		{
-			csv: `1	"some,""more
-""
-	quoted,
-text,"	a
-2	"some,
-quoted,\t
-	text,"	b
-3	"some,
-quoted,
-	text"	c
-4	"some,
-quoted,
-text,"	d`,
-			expectedDelimiter: '\t',
-		},
-		// case 1 - semicolon delmited with quotes and semicolon in value
-		{
-			csv: `col1;col2
-"this has a literal "" in the text";"and an ; in the text"`,
-			expectedDelimiter: ';',
-		},
-		// case 2 - pipe delimited with quotes
-		{
-			csv: `Col1 | Col2 | Col3
-abc   | "Hello
-World"|123
-"de
-|
-f" | 4.56 | 789`,
-			expectedDelimiter: '|',
-		},
 		// case 3 - a complicated quoted CSV that is semicolon delmiited
 		{
 			csv: `he; she
@@ -547,7 +521,7 @@ a|"he said, ""here I am"""`,
 
 	for n, c := range cases {
 		delimiter := guessFromBeforeAfterQuotes([]byte(decodeSlashes(t, c.csv)))
-		assert.EqualValues(t, c.expectedDelimiter, delimiter, "case %d: delimiter should be equal, expected '%c' got '%c'", n, c.expectedDelimiter, delimiter)
+		assert.Equal(t, c.expectedDelimiter, delimiter, "case %d: delimiter should be equal, expected '%c' got '%c'", n, c.expectedDelimiter, delimiter)
 	}
 }
 
@@ -561,14 +535,14 @@ func TestFormatError(t *testing.T) {
 			err: &csv.ParseError{
 				Err: csv.ErrFieldCount,
 			},
-			expectedMessage: "repo.error.csv.invalid_field_count",
+			expectedMessage: "repo.error.csv.invalid_field_count:0",
 			expectsError:    false,
 		},
 		{
 			err: &csv.ParseError{
 				Err: csv.ErrBareQuote,
 			},
-			expectedMessage: "repo.error.csv.unexpected",
+			expectedMessage: "repo.error.csv.unexpected:0,0",
 			expectsError:    false,
 		},
 		{
@@ -583,7 +557,7 @@ func TestFormatError(t *testing.T) {
 			assert.Error(t, err, "case %d: expected an error to be returned", n)
 		} else {
 			assert.NoError(t, err, "case %d: no error was expected, got error: %v", n, err)
-			assert.EqualValues(t, c.expectedMessage, message, "case %d: messages should be equal, expected '%s' got '%s'", n, c.expectedMessage, message)
+			assert.Equal(t, c.expectedMessage, message, "case %d: messages should be equal, expected '%s' got '%s'", n, c.expectedMessage, message)
 		}
 	}
 }

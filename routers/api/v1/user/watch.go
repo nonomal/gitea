@@ -4,33 +4,42 @@
 package user
 
 import (
-	std_context "context"
+	"errors"
 	"net/http"
 
-	"code.gitea.io/gitea/models/db"
-	access_model "code.gitea.io/gitea/models/perm/access"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/context"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/routers/api/v1/utils"
-	"code.gitea.io/gitea/services/convert"
+	access_model "gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
 )
 
 // getWatchedRepos returns the repos that the user with the specified userID is watching
-func getWatchedRepos(ctx std_context.Context, user *user_model.User, private bool, listOptions db.ListOptions) ([]*api.Repository, int64, error) {
-	watchedRepos, total, err := repo_model.GetWatchedRepos(ctx, user.ID, private, listOptions)
+func getWatchedRepos(ctx *context.APIContext, user *user_model.User, private bool) ([]*api.Repository, int64, error) {
+	opts := &repo_model.WatchedReposOptions{
+		ListOptions:    utils.GetListOptions(ctx),
+		WatcherID:      user.ID,
+		IncludePrivate: private,
+		Actor:          ctx.Doer,
+	}
+
+	watchedRepos, total, err := repo_model.GetWatchedRepos(ctx, opts)
 	if err != nil {
+		return nil, 0, err
+	}
+	if err := repo_model.RepositoryList(watchedRepos).LoadAttributes(ctx); err != nil {
 		return nil, 0, err
 	}
 
 	repos := make([]*api.Repository, len(watchedRepos))
 	for i, watched := range watchedRepos {
-		access, err := access_model.AccessLevel(ctx, user, watched)
+		permission, err := access_model.GetIndividualUserRepoPermission(ctx, watched, user)
 		if err != nil {
 			return nil, 0, err
 		}
-		repos[i] = convert.ToRepo(ctx, watched, access)
+		repos[i] = convert.ToRepo(ctx, watched, permission)
 	}
 	return repos, total, nil
 }
@@ -46,7 +55,7 @@ func GetWatchedRepos(ctx *context.APIContext) {
 	// - name: username
 	//   type: string
 	//   in: path
-	//   description: username of the user
+	//   description: username of the user whose watched repos are to be listed
 	//   required: true
 	// - name: page
 	//   in: query
@@ -59,13 +68,17 @@ func GetWatchedRepos(ctx *context.APIContext) {
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/RepositoryList"
+	//   default:
+	//     "$ref": "#/responses/error"
 
 	private := ctx.ContextUser.ID == ctx.Doer.ID
-	repos, total, err := getWatchedRepos(ctx, ctx.ContextUser, private, utils.GetListOptions(ctx))
+	repos, total, err := getWatchedRepos(ctx, ctx.ContextUser, private)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "getWatchedRepos", err)
+		ctx.APIErrorInternal(err)
+		return
 	}
 
+	ctx.SetLinkHeader(total, utils.GetListOptions(ctx).PageSize)
 	ctx.SetTotalCountHeader(total)
 	ctx.JSON(http.StatusOK, &repos)
 }
@@ -90,11 +103,12 @@ func GetMyWatchedRepos(ctx *context.APIContext) {
 	//   "200":
 	//     "$ref": "#/responses/RepositoryList"
 
-	repos, total, err := getWatchedRepos(ctx, ctx.Doer, true, utils.GetListOptions(ctx))
+	repos, total, err := getWatchedRepos(ctx, ctx.Doer, true)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "getWatchedRepos", err)
+		ctx.APIErrorInternal(err)
+		return
 	}
-
+	ctx.SetLinkHeader(total, utils.GetListOptions(ctx).PageSize)
 	ctx.SetTotalCountHeader(total)
 	ctx.JSON(http.StatusOK, &repos)
 }
@@ -119,10 +133,10 @@ func IsWatching(ctx *context.APIContext) {
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/WatchInfo"
-	//   "404":
-	//     description: User is not watching this repo or repo do not exist
+	//   default:
+	//     "$ref": "#/responses/error"
 
-	if repo_model.IsWatching(ctx.Doer.ID, ctx.Repo.Repository.ID) {
+	if repo_model.IsWatchingRepo(ctx, ctx.Doer.ID, ctx.Repo.Repository.ID) {
 		ctx.JSON(http.StatusOK, api.WatchInfo{
 			Subscribed:    true,
 			Ignored:       false,
@@ -132,7 +146,7 @@ func IsWatching(ctx *context.APIContext) {
 			RepositoryURL: ctx.Repo.Repository.APIURL(),
 		})
 	} else {
-		ctx.NotFound()
+		ctx.APIErrorNotFound()
 	}
 }
 
@@ -155,10 +169,16 @@ func Watch(ctx *context.APIContext) {
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/WatchInfo"
+	//   default:
+	//     "$ref": "#/responses/error"
 
-	err := repo_model.WatchRepo(ctx, ctx.Doer.ID, ctx.Repo.Repository.ID, true)
+	err := repo_model.WatchRepoAuto(ctx, ctx.Doer, ctx.Repo.Repository, true)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "WatchRepo", err)
+		if errors.Is(err, user_model.ErrBlockedUser) {
+			ctx.APIError(http.StatusForbidden, err.Error())
+		} else {
+			ctx.APIErrorInternal(err)
+		}
 		return
 	}
 	ctx.JSON(http.StatusOK, api.WatchInfo{
@@ -190,10 +210,12 @@ func Unwatch(ctx *context.APIContext) {
 	// responses:
 	//   "204":
 	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
 
-	err := repo_model.WatchRepo(ctx, ctx.Doer.ID, ctx.Repo.Repository.ID, false)
+	err := repo_model.WatchRepoAuto(ctx, ctx.Doer, ctx.Repo.Repository, false)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "UnwatchRepo", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	ctx.Status(http.StatusNoContent)

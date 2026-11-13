@@ -6,154 +6,119 @@ package webhook
 import (
 	"testing"
 
-	api "code.gitea.io/gitea/modules/structs"
-	webhook_module "code.gitea.io/gitea/modules/webhook"
+	webhook_model "gitea.dev/models/webhook"
+	"gitea.dev/modules/json"
+	api "gitea.dev/modules/structs"
+	webhook_module "gitea.dev/modules/webhook"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestPackagistPayload(t *testing.T) {
-	t.Run("Create", func(t *testing.T) {
-		p := createTestPayload()
-
-		d := new(PackagistPayload)
-		pl, err := d.Create(p)
-		require.NoError(t, err)
-		require.Nil(t, pl)
-	})
-
-	t.Run("Delete", func(t *testing.T) {
-		p := deleteTestPayload()
-
-		d := new(PackagistPayload)
-		pl, err := d.Delete(p)
-		require.NoError(t, err)
-		require.Nil(t, pl)
-	})
-
-	t.Run("Fork", func(t *testing.T) {
-		p := forkTestPayload()
-
-		d := new(PackagistPayload)
-		pl, err := d.Fork(p)
-		require.NoError(t, err)
-		require.Nil(t, pl)
-	})
+	pc := packagistConvertor{
+		PackageURL: "https://packagist.org/packages/example",
+	}
+	for _, testCase := range []struct {
+		name string
+		call func() (PackagistPayload, error)
+	}{
+		{"Create", func() (PackagistPayload, error) { return pc.Create(createTestPayload()) }},
+		{"Delete", func() (PackagistPayload, error) { return pc.Delete(deleteTestPayload()) }},
+		{"Fork", func() (PackagistPayload, error) { return pc.Fork(forkTestPayload()) }},
+		{"IssueComment", func() (PackagistPayload, error) { return pc.IssueComment(issueCommentTestPayload()) }},
+		{"PullRequest", func() (PackagistPayload, error) { return pc.PullRequest(pullRequestTestPayload()) }},
+		{"PullRequestComment", func() (PackagistPayload, error) { return pc.IssueComment(pullRequestCommentTestPayload()) }},
+		{"Review", func() (PackagistPayload, error) {
+			p := pullRequestTestPayload()
+			p.Action = api.HookIssueReviewed
+			return pc.Review(p, webhook_module.HookEventPullRequestReviewApproved)
+		}},
+		{"Repository", func() (PackagistPayload, error) { return pc.Repository(repositoryTestPayload()) }},
+		{"Package", func() (PackagistPayload, error) { return pc.Package(packageTestPayload()) }},
+		{"Release", func() (PackagistPayload, error) { return pc.Release(pullReleaseTestPayload()) }},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			pl, err := testCase.call()
+			require.NoError(t, err)
+			require.Equal(t, PackagistPayload{}, pl)
+		})
+	}
 
 	t.Run("Push", func(t *testing.T) {
 		p := pushTestPayload()
 
-		d := new(PackagistPayload)
-		d.PackagistRepository.URL = "https://packagist.org/api/update-package?username=THEUSERNAME&apiToken=TOPSECRETAPITOKEN"
-		pl, err := d.Push(p)
+		pl, err := pc.Push(p)
 		require.NoError(t, err)
-		require.NotNil(t, pl)
-		require.IsType(t, &PackagistPayload{}, pl)
 
-		assert.Equal(t, "https://packagist.org/api/update-package?username=THEUSERNAME&apiToken=TOPSECRETAPITOKEN", pl.(*PackagistPayload).PackagistRepository.URL)
+		assert.Equal(t, "https://packagist.org/packages/example", pl.PackagistRepository.URL)
 	})
 
 	t.Run("Issue", func(t *testing.T) {
 		p := issueTestPayload()
-
-		d := new(PackagistPayload)
-		p.Action = api.HookIssueOpened
-		pl, err := d.Issue(p)
-		require.NoError(t, err)
-		require.Nil(t, pl)
-
-		p.Action = api.HookIssueClosed
-		pl, err = d.Issue(p)
-		require.NoError(t, err)
-		require.Nil(t, pl)
-	})
-
-	t.Run("IssueComment", func(t *testing.T) {
-		p := issueCommentTestPayload()
-
-		d := new(PackagistPayload)
-		pl, err := d.IssueComment(p)
-		require.NoError(t, err)
-		require.Nil(t, pl)
-	})
-
-	t.Run("PullRequest", func(t *testing.T) {
-		p := pullRequestTestPayload()
-
-		d := new(PackagistPayload)
-		pl, err := d.PullRequest(p)
-		require.NoError(t, err)
-		require.Nil(t, pl)
-	})
-
-	t.Run("PullRequestComment", func(t *testing.T) {
-		p := pullRequestCommentTestPayload()
-
-		d := new(PackagistPayload)
-		pl, err := d.IssueComment(p)
-		require.NoError(t, err)
-		require.Nil(t, pl)
-	})
-
-	t.Run("Review", func(t *testing.T) {
-		p := pullRequestTestPayload()
-		p.Action = api.HookIssueReviewed
-
-		d := new(PackagistPayload)
-		pl, err := d.Review(p, webhook_module.HookEventPullRequestReviewApproved)
-		require.NoError(t, err)
-		require.Nil(t, pl)
-	})
-
-	t.Run("Repository", func(t *testing.T) {
-		p := repositoryTestPayload()
-
-		d := new(PackagistPayload)
-		pl, err := d.Repository(p)
-		require.NoError(t, err)
-		require.Nil(t, pl)
+		for _, action := range []api.HookIssueAction{api.HookIssueOpened, api.HookIssueClosed} {
+			p.Action = action
+			pl, err := pc.Issue(p)
+			require.NoError(t, err)
+			require.Equal(t, PackagistPayload{}, pl)
+		}
 	})
 
 	t.Run("Wiki", func(t *testing.T) {
 		p := wikiTestPayload()
-
-		d := new(PackagistPayload)
-		p.Action = api.HookWikiCreated
-		pl, err := d.Wiki(p)
-		require.NoError(t, err)
-		require.Nil(t, pl)
-
-		p.Action = api.HookWikiEdited
-		pl, err = d.Wiki(p)
-		require.NoError(t, err)
-		require.Nil(t, pl)
-
-		p.Action = api.HookWikiDeleted
-		pl, err = d.Wiki(p)
-		require.NoError(t, err)
-		require.Nil(t, pl)
-	})
-
-	t.Run("Release", func(t *testing.T) {
-		p := pullReleaseTestPayload()
-
-		d := new(PackagistPayload)
-		pl, err := d.Release(p)
-		require.NoError(t, err)
-		require.Nil(t, pl)
+		for _, action := range []api.HookWikiAction{api.HookWikiCreated, api.HookWikiEdited, api.HookWikiDeleted} {
+			p.Action = action
+			pl, err := pc.Wiki(p)
+			require.NoError(t, err)
+			require.Equal(t, PackagistPayload{}, pl)
+		}
 	})
 }
 
 func TestPackagistJSONPayload(t *testing.T) {
-	p := pushTestPayload()
+	for _, testCase := range []struct {
+		event   webhook_module.HookEventType
+		payload func() api.Payloader
+	}{
+		{webhook_module.HookEventPush, func() api.Payloader { return pushTestPayload() }},
+		{webhook_module.HookEventCreate, func() api.Payloader { return createTestPayload() }},
+	} {
+		t.Run(string(testCase.event), func(t *testing.T) {
+			data, err := testCase.payload().JSONPayload()
+			require.NoError(t, err)
 
-	pl, err := new(PackagistPayload).Push(p)
-	require.NoError(t, err)
-	require.NotNil(t, pl)
-	require.IsType(t, &PackagistPayload{}, pl)
+			hook := &webhook_model.Webhook{
+				RepoID:     3,
+				IsActive:   true,
+				Type:       webhook_module.PACKAGIST,
+				URL:        "https://packagist.org/api/update-package?username=THEUSERNAME&apiToken=TOPSECRETAPITOKEN",
+				Meta:       `{"package_url":"https://packagist.org/packages/example"}`,
+				HTTPMethod: "POST",
+			}
+			task := &webhook_model.HookTask{
+				HookID:         hook.ID,
+				EventType:      testCase.event,
+				PayloadContent: string(data),
+				PayloadVersion: 2,
+			}
 
-	json, err := pl.JSONPayload()
-	require.NoError(t, err)
-	assert.NotEmpty(t, json)
+			req, reqBody, err := newPackagistRequest(t.Context(), hook, task)
+			require.NotNil(t, req)
+			require.NotNil(t, reqBody)
+			require.NoError(t, err)
+
+			assert.Equal(t, "POST", req.Method)
+			assert.Equal(t, "https://packagist.org/api/update-package?username=THEUSERNAME&apiToken=TOPSECRETAPITOKEN", req.URL.String())
+			assert.Equal(t, "sha256=", req.Header.Get("X-Hub-Signature-256"))
+			assert.Equal(t, "application/json", req.Header.Get("Content-Type"))
+			var body PackagistPayload
+			err = json.NewDecoder(req.Body).Decode(&body)
+			assert.NoError(t, err)
+			if testCase.event == webhook_module.HookEventPush {
+				assert.Equal(t, "https://packagist.org/packages/example", body.PackagistRepository.URL)
+			} else {
+				assert.Empty(t, body.PackagistRepository.URL)
+			}
+		})
+	}
 }

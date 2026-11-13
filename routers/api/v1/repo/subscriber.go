@@ -6,11 +6,11 @@ package repo
 import (
 	"net/http"
 
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/modules/context"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/routers/api/v1/utils"
-	"code.gitea.io/gitea/services/convert"
+	repo_model "gitea.dev/models/repo"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
 )
 
 // ListSubscribers list a repo's subscribers (i.e. watchers)
@@ -42,10 +42,12 @@ func ListSubscribers(ctx *context.APIContext) {
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/UserList"
+	//   default:
+	//     "$ref": "#/responses/error"
 
-	subscribers, err := repo_model.GetRepoWatchers(ctx.Repo.Repository.ID, utils.GetListOptions(ctx))
+	subscribers, err := repo_model.GetRepoWatchers(ctx, ctx.Repo.Repository.ID, utils.GetListOptions(ctx))
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "GetRepoWatchers", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	users := make([]*api.User, len(subscribers))

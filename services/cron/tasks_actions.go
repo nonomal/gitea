@@ -6,9 +6,9 @@ package cron
 import (
 	"context"
 
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/setting"
-	actions_service "code.gitea.io/gitea/services/actions"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/setting"
+	actions_service "gitea.dev/services/actions"
 )
 
 func initActionsTasks() {
@@ -18,6 +18,9 @@ func initActionsTasks() {
 	registerStopZombieTasks()
 	registerStopEndlessTasks()
 	registerCancelAbandonedJobs()
+	registerScheduleTasks()
+	registerActionsCleanup()
+	registerCleanupActionRuns()
 }
 
 func registerStopZombieTasks() {
@@ -25,7 +28,7 @@ func registerStopZombieTasks() {
 		Enabled:    true,
 		RunAtStart: true,
 		Schedule:   "@every 5m",
-	}, func(ctx context.Context, _ *user_model.User, cfg Config) error {
+	}, func(ctx context.Context, _ *user_model.User, _ *BaseConfig) error {
 		return actions_service.StopZombieTasks(ctx)
 	})
 }
@@ -35,7 +38,7 @@ func registerStopEndlessTasks() {
 		Enabled:    true,
 		RunAtStart: true,
 		Schedule:   "@every 30m",
-	}, func(ctx context.Context, _ *user_model.User, cfg Config) error {
+	}, func(ctx context.Context, _ *user_model.User, _ *BaseConfig) error {
 		return actions_service.StopEndlessTasks(ctx)
 	})
 }
@@ -45,7 +48,40 @@ func registerCancelAbandonedJobs() {
 		Enabled:    true,
 		RunAtStart: true,
 		Schedule:   "@every 6h",
-	}, func(ctx context.Context, _ *user_model.User, cfg Config) error {
+	}, func(ctx context.Context, _ *user_model.User, _ *BaseConfig) error {
 		return actions_service.CancelAbandonedJobs(ctx)
+	})
+}
+
+// registerScheduleTasks registers a scheduled task that runs every minute to start any due schedule tasks.
+func registerScheduleTasks() {
+	// Register the task with a unique name, enabled status, and schedule for every minute.
+	RegisterTaskFatal("start_schedule_tasks", &BaseConfig{
+		Enabled:    true,
+		RunAtStart: false,
+		Schedule:   "@every 1m",
+	}, func(ctx context.Context, _ *user_model.User, _ *BaseConfig) error {
+		// Call the function to start schedule tasks and pass the context.
+		return actions_service.StartScheduleTasks(ctx)
+	})
+}
+
+func registerActionsCleanup() {
+	RegisterTaskFatal("cleanup_actions", &BaseConfig{
+		Enabled:    true,
+		RunAtStart: false,
+		Schedule:   "@midnight",
+	}, func(ctx context.Context, _ *user_model.User, _ *BaseConfig) error {
+		return actions_service.Cleanup(ctx)
+	})
+}
+
+func registerCleanupActionRuns() {
+	RegisterTaskFatal("cleanup_action_runs", &BaseConfig{
+		Enabled:    true,
+		RunAtStart: false,
+		Schedule:   "@midnight",
+	}, func(ctx context.Context, _ *user_model.User, _ *BaseConfig) error {
+		return actions_service.CleanupOldRuns(ctx)
 	})
 }

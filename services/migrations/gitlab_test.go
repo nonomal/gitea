@@ -9,68 +9,70 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
 
-	base "code.gitea.io/gitea/modules/migration"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/json"
+	base "gitea.dev/modules/migration"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/xanzy/go-gitlab"
+	"github.com/stretchr/testify/require"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 )
 
 func TestGitlabDownloadRepo(t *testing.T) {
-	// Skip tests if Gitlab token is not found
-	gitlabPersonalAccessToken := os.Getenv("GITLAB_READ_TOKEN")
-	if gitlabPersonalAccessToken == "" {
-		t.Skip("skipped test because GITLAB_READ_TOKEN was not in the environment")
-	}
+	token := os.Getenv("GITLAB_READ_TOKEN")
+	liveMode := token != ""
 
-	resp, err := http.Get("https://gitlab.com/gitea/test_repo")
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Skipf("Can't access test repo, skipping %s", t.Name())
-	}
+	_, callerFile, _, _ := runtime.Caller(0)
+	fixtureDir := filepath.Join(filepath.Dir(callerFile), "_mock_data/TestGitlabDownloadRepo")
+	mockServer := unittest.NewMockWebServer(t, "https://gitlab.com", fixtureDir, liveMode)
 
-	downloader, err := NewGitlabDownloader(context.Background(), "https://gitlab.com", "gitea/test_repo", "", "", gitlabPersonalAccessToken)
+	ctx := t.Context()
+	downloader, err := NewGitlabDownloader(ctx, mockServer.URL, "gitea/test_repo", token)
 	if err != nil {
 		t.Fatalf("NewGitlabDownloader is nil: %v", err)
 	}
-	repo, err := downloader.GetRepoInfo()
+	repo, err := downloader.GetRepoInfo(ctx)
 	assert.NoError(t, err)
 	// Repo Owner is blank in Gitlab Group repos
 	assertRepositoryEqual(t, &base.Repository{
 		Name:          "test_repo",
 		Owner:         "",
 		Description:   "Test repository for testing migration from gitlab to gitea",
-		CloneURL:      "https://gitlab.com/gitea/test_repo.git",
-		OriginalURL:   "https://gitlab.com/gitea/test_repo",
+		CloneURL:      mockServer.URL + "/gitea/test_repo.git",
+		OriginalURL:   mockServer.URL + "/gitea/test_repo",
 		DefaultBranch: "master",
 	}, repo)
 
-	topics, err := downloader.GetTopics()
+	topics, err := downloader.GetTopics(ctx)
 	assert.NoError(t, err)
-	assert.True(t, len(topics) == 2)
-	assert.EqualValues(t, []string{"migration", "test"}, topics)
+	assert.Len(t, topics, 2)
+	assert.Equal(t, []string{"migration", "test"}, topics)
 
-	milestones, err := downloader.GetMilestones()
+	milestones, err := downloader.GetMilestones(ctx)
 	assert.NoError(t, err)
 	assertMilestonesEqual(t, []*base.Milestone{
 		{
 			Title:   "1.1.0",
 			Created: time.Date(2019, 11, 28, 8, 42, 44, 575000000, time.UTC),
-			Updated: timePtr(time.Date(2019, 11, 28, 8, 42, 44, 575000000, time.UTC)),
+			Updated: new(time.Date(2019, 11, 28, 8, 42, 44, 575000000, time.UTC)),
 			State:   "active",
 		},
 		{
 			Title:   "1.0.0",
 			Created: time.Date(2019, 11, 28, 8, 42, 30, 301000000, time.UTC),
-			Updated: timePtr(time.Date(2019, 11, 28, 15, 57, 52, 401000000, time.UTC)),
-			Closed:  timePtr(time.Date(2019, 11, 28, 15, 57, 52, 401000000, time.UTC)),
+			Updated: new(time.Date(2019, 11, 28, 15, 57, 52, 401000000, time.UTC)),
+			Closed:  new(time.Date(2019, 11, 28, 15, 57, 52, 401000000, time.UTC)),
 			State:   "closed",
 		},
 	}, milestones)
 
-	labels, err := downloader.GetLabels()
+	labels, err := downloader.GetLabels(ctx)
 	assert.NoError(t, err)
 	assertLabelsEqual(t, []*base.Label{
 		{
@@ -111,7 +113,7 @@ func TestGitlabDownloadRepo(t *testing.T) {
 		},
 	}, labels)
 
-	releases, err := downloader.GetReleases()
+	releases, err := downloader.GetReleases(ctx)
 	assert.NoError(t, err)
 	assertReleasesEqual(t, []*base.Release{
 		{
@@ -125,7 +127,7 @@ func TestGitlabDownloadRepo(t *testing.T) {
 		},
 	}, releases)
 
-	issues, isEnd, err := downloader.GetIssues(1, 2)
+	issues, isEnd, err := downloader.GetIssues(ctx, 1, 2)
 	assert.NoError(t, err)
 	assert.False(t, isEnd)
 
@@ -160,7 +162,7 @@ func TestGitlabDownloadRepo(t *testing.T) {
 					Content:  "open_mouth",
 				},
 			},
-			Closed: timePtr(time.Date(2019, 11, 28, 8, 46, 23, 275000000, time.UTC)),
+			Closed: new(time.Date(2019, 11, 28, 8, 46, 23, 275000000, time.UTC)),
 		},
 		{
 			Number:     2,
@@ -209,11 +211,11 @@ func TestGitlabDownloadRepo(t *testing.T) {
 					Content:  "hearts",
 				},
 			},
-			Closed: timePtr(time.Date(2019, 11, 28, 8, 45, 44, 959000000, time.UTC)),
+			Closed: new(time.Date(2019, 11, 28, 8, 45, 44, 959000000, time.UTC)),
 		},
 	}, issues)
 
-	comments, _, err := downloader.GetComments(&base.Issue{
+	comments, _, err := downloader.GetComments(ctx, &base.Issue{
 		Number:       2,
 		ForeignIndex: 2,
 		Context:      gitlabIssueContext{IsMergeRequest: false},
@@ -254,85 +256,131 @@ func TestGitlabDownloadRepo(t *testing.T) {
 		},
 	}, comments)
 
-	prs, _, err := downloader.GetPullRequests(1, 1)
+	prs, _, err := downloader.GetPullRequests(ctx, 1, 2)
 	assert.NoError(t, err)
 	assertPullRequestsEqual(t, []*base.PullRequest{
 		{
-			Number:     4,
-			Title:      "Test branch",
-			Content:    "do not merge this PR",
-			Milestone:  "1.0.0",
-			PosterID:   1241334,
-			PosterName: "lafriks",
-			State:      "opened",
-			Created:    time.Date(2019, 11, 28, 15, 56, 54, 104000000, time.UTC),
-			Labels: []*base.Label{
-				{
-					Name: "bug",
-				},
-			},
-			Reactions: []*base.Reaction{{
-				UserID:   4575606,
-				UserName: "real6543",
-				Content:  "thumbsup",
-			}, {
-				UserID:   4575606,
-				UserName: "real6543",
-				Content:  "tada",
-			}},
-			PatchURL: "https://gitlab.com/gitea/test_repo/-/merge_requests/2.patch",
+			Number:     6,
+			Title:      "Test/parsing",
+			Content:    "This MR was created in error, feel free to delete when convenient. Sorry for the noise.",
+			Milestone:  "",
+			PosterID:   10529876,
+			PosterName: "patdyn",
+			State:      "closed",
+			Created:    time.Date(2025, 11, 25, 9, 21, 42, 628000000, time.UTC),
+			Labels:     []*base.Label{},
+			Reactions:  []*base.Reaction{},
+			PatchURL:   mockServer.URL + "/gitea/test_repo/-/merge_requests/4.patch",
 			Head: base.PullRequestBranch{
-				Ref:       "feat/test",
-				CloneURL:  "https://gitlab.com/gitea/test_repo/-/merge_requests/2",
-				SHA:       "9f733b96b98a4175276edf6a2e1231489c3bdd23",
+				Ref:       "test/parsing",
+				CloneURL:  mockServer.URL + "/gitea/test_repo/-/merge_requests/4",
+				SHA:       "c59c9b451acca9d106cc19d61d87afe3fbbb8b83",
 				RepoName:  "test_repo",
-				OwnerName: "lafriks",
+				OwnerName: "patdyn",
 			},
 			Base: base.PullRequestBranch{
 				Ref:       "master",
-				SHA:       "",
-				OwnerName: "lafriks",
+				SHA:       "c59c9b451acca9d106cc19d61d87afe3fbbb8b83",
+				OwnerName: "patdyn",
 				RepoName:  "test_repo",
 			},
-			Closed:         nil,
+			Closed:         new(time.Date(2025, 11, 25, 9, 43, 14, 581000000, time.UTC)),
 			Merged:         false,
 			MergedTime:     nil,
 			MergeCommitSHA: "",
-			ForeignIndex:   2,
+			ForeignIndex:   4,
+			Context:        gitlabIssueContext{IsMergeRequest: true},
+		},
+		{
+			Number:     5,
+			Title:      "Test branch",
+			Content:    "do not merge this PR",
+			Milestone:  "",
+			PosterID:   2005797,
+			PosterName: "oliverpool",
+			State:      "closed",
+			Created:    time.Date(2024, 9, 3, 7, 52, 8, 78000000, time.UTC),
+			Labels:     []*base.Label{},
+			Reactions: []*base.Reaction{{
+				UserID:   2005797,
+				UserName: "oliverpool",
+				Content:  "thumbsup",
+			}},
+			PatchURL: mockServer.URL + "/gitea/test_repo/-/merge_requests/3.patch",
+			Head: base.PullRequestBranch{
+				Ref:       "feat/test",
+				CloneURL:  mockServer.URL + "/gitea/test_repo/-/merge_requests/3",
+				SHA:       "9f733b96b98a4175276edf6a2e1231489c3bdd23",
+				RepoName:  "test_repo",
+				OwnerName: "oliverpool",
+			},
+			Base: base.PullRequestBranch{
+				Ref:       "master",
+				SHA:       "c59c9b451acca9d106cc19d61d87afe3fbbb8b83",
+				OwnerName: "oliverpool",
+				RepoName:  "test_repo",
+			},
+			Closed:         new(time.Date(2024, 9, 3, 7, 52, 28, 488000000, time.UTC)),
+			Merged:         false,
+			MergedTime:     nil,
+			MergeCommitSHA: "",
+			ForeignIndex:   3,
 			Context:        gitlabIssueContext{IsMergeRequest: true},
 		},
 	}, prs)
 
-	rvs, err := downloader.GetReviews(&base.PullRequest{Number: 1, ForeignIndex: 1})
+	rvs, err := downloader.GetReviews(ctx, &base.PullRequest{Number: 1, ForeignIndex: 1})
 	assert.NoError(t, err)
 	assertReviewsEqual(t, []*base.Review{
 		{
 			IssueIndex:   1,
-			ReviewerID:   4102996,
-			ReviewerName: "zeripath",
-			CreatedAt:    time.Date(2019, 11, 28, 16, 2, 8, 377000000, time.UTC),
+			ReviewerID:   527793,
+			ReviewerName: "axifive",
+			CreatedAt:    time.Date(2019, 11, 28, 8, 54, 41, 34000000, time.UTC),
 			State:        "APPROVED",
 		},
 		{
 			IssueIndex:   1,
-			ReviewerID:   527793,
-			ReviewerName: "axifive",
-			CreatedAt:    time.Date(2019, 11, 28, 16, 2, 8, 377000000, time.UTC),
+			ReviewerID:   4102996,
+			ReviewerName: "zeripath",
+			CreatedAt:    time.Date(2019, 11, 28, 8, 54, 41, 34000000, time.UTC),
 			State:        "APPROVED",
 		},
 	}, rvs)
 
-	rvs, err = downloader.GetReviews(&base.PullRequest{Number: 2, ForeignIndex: 2})
+	rvs, err = downloader.GetReviews(ctx, &base.PullRequest{Number: 2, ForeignIndex: 2})
 	assert.NoError(t, err)
 	assertReviewsEqual(t, []*base.Review{
 		{
 			IssueIndex:   2,
 			ReviewerID:   4575606,
 			ReviewerName: "real6543",
-			CreatedAt:    time.Date(2020, 4, 19, 19, 24, 21, 108000000, time.UTC),
+			CreatedAt:    time.Date(2019, 11, 28, 15, 56, 54, 104000000, time.UTC),
 			State:        "APPROVED",
 		},
 	}, rvs)
+}
+
+func TestGitlabVersionProbeUsesMigrationContext(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := NewGitlabDownloader(ctx, server.URL, "owner/repo", "")
+		result <- err
+	}()
+
+	<-started
+	cancel()
+	assert.Error(t, <-result)
 }
 
 func gitlabClientMockSetup(t *testing.T) (*http.ServeMux, *httptest.Server, *gitlab.Client) {
@@ -357,7 +405,7 @@ func gitlabClientMockTeardown(server *httptest.Server) {
 }
 
 type reviewTestCase struct {
-	repoID, prID, reviewerID int
+	repoID, prID, reviewerID int64
 	reviewerName             string
 	createdAt, updatedAt     *time.Time
 	expectedCreatedAt        time.Time
@@ -382,8 +430,8 @@ func convertTestCase(t reviewTestCase) (func(w http.ResponseWriter, r *http.Requ
 		fmt.Fprint(w, `
 {
   "id": 5,
-  "iid": `+strconv.Itoa(t.prID)+`,
-  "project_id": `+strconv.Itoa(t.repoID)+`,
+  "iid": `+strconv.FormatInt(t.prID, 10)+`,
+  "project_id": `+strconv.FormatInt(t.repoID, 10)+`,
   "title": "Approvals API",
   "description": "Test",
   "state": "opened",
@@ -397,7 +445,7 @@ func convertTestCase(t reviewTestCase) (func(w http.ResponseWriter, r *http.Requ
       "user": {
         "name": "Administrator",
         "username": "`+t.reviewerName+`",
-        "id": `+strconv.Itoa(t.reviewerID)+`,
+        "id": `+strconv.FormatInt(t.reviewerID, 10)+`,
         "state": "active",
         "avatar_url": "http://www.gravatar.com/avatar/e64c7d89f26bd1972efa854d13d7dd61?s=80\u0026d=identicon",
         "web_url": "http://localhost:3000/root"
@@ -407,8 +455,8 @@ func convertTestCase(t reviewTestCase) (func(w http.ResponseWriter, r *http.Requ
 }`)
 	}
 	review := base.Review{
-		IssueIndex:   int64(t.prID),
-		ReviewerID:   int64(t.reviewerID),
+		IssueIndex:   t.prID,
+		ReviewerID:   t.reviewerID,
 		ReviewerName: t.reviewerName,
 		CreatedAt:    t.expectedCreatedAt,
 		State:        "APPROVED",
@@ -421,10 +469,9 @@ func TestGitlabGetReviews(t *testing.T) {
 	mux, server, client := gitlabClientMockSetup(t)
 	defer gitlabClientMockTeardown(server)
 
-	repoID := 1324
-
+	var repoID int64 = 1324
+	ctx := t.Context()
 	downloader := &GitlabDownloader{
-		ctx:    context.Background(),
 		client: client,
 		repoID: repoID,
 	}
@@ -463,9 +510,145 @@ func TestGitlabGetReviews(t *testing.T) {
 		mock, review := convertTestCase(testCase)
 		mux.HandleFunc(fmt.Sprintf("/api/v4/projects/%d/merge_requests/%d/approvals", testCase.repoID, testCase.prID), mock)
 
-		id := int64(testCase.prID)
-		rvs, err := downloader.GetReviews(&base.Issue{Number: id, ForeignIndex: id})
+		rvs, err := downloader.GetReviews(ctx, &base.Issue{Number: testCase.prID, ForeignIndex: testCase.prID})
 		assert.NoError(t, err)
 		assertReviewsEqual(t, []*base.Review{&review}, rvs)
 	}
+
+	mux.HandleFunc(fmt.Sprintf("/api/v4/projects/%d/merge_requests/4/approvals", repoID), func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"approved_by": [{"user": null}]}`)
+	})
+	rvs, err := downloader.GetReviews(ctx, &base.Issue{Number: 4, ForeignIndex: 4})
+	require.NoError(t, err)
+	assert.Empty(t, rvs)
+}
+
+func TestGitlabSkipsConfidentialIssuesAndInternalNotes(t *testing.T) {
+	mux, server, client := gitlabClientMockSetup(t)
+	defer gitlabClientMockTeardown(server)
+	downloader := &GitlabDownloader{client: client, repoID: 1, maxPerPage: 100}
+	const timestamps = `"created_at": "2020-01-01T00:00:00Z", "updated_at": "2020-01-01T00:00:00Z"`
+	empty := func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, `[]`) }
+	mux.HandleFunc("/api/v4/projects/1/issues", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `[{"iid": 1, "author": {}, `+timestamps+`}, {"iid": 2, "confidential": true}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/issues/1/award_emoji", empty)
+	mux.HandleFunc("/api/v4/projects/1/issues/1/discussions", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `[{"notes": [{"id": 1, `+timestamps+`}, {"internal": true}]}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/issues/1/resource_state_events", empty)
+
+	issues, _, err := downloader.GetIssues(t.Context(), 1, 100)
+	require.NoError(t, err)
+	require.Len(t, issues, 1)
+	assert.EqualValues(t, 3, downloader.iidResolver.generatePullRequestNumber(1))
+
+	comments, _, err := downloader.GetComments(t.Context(), issues[0])
+	require.NoError(t, err)
+	require.Len(t, comments, 1)
+	assert.EqualValues(t, 1, comments[0].Index)
+}
+
+func TestAwardsToReactions(t *testing.T) {
+	downloader := &GitlabDownloader{}
+	// yes gitlab can have duplicated reactions (https://gitlab.com/jaywink/socialhome/-/issues/24)
+	testResponse := `
+[
+  {
+    "name": "thumbsup",
+    "user": {
+      "id": 1241334,
+      "username": "lafriks"
+    }
+  },
+  {
+    "name": "thumbsup",
+    "user": {
+      "id": 1241334,
+      "username": "lafriks"
+    }
+  },
+  {
+    "name": "thumbsup",
+    "user": {
+      "id": 4575606,
+      "username": "real6543"
+    }
+  }
+]
+`
+	var awards []*gitlab.AwardEmoji
+	assert.NoError(t, json.Unmarshal([]byte(testResponse), &awards))
+
+	reactions := downloader.awardsToReactions(awards)
+	assert.Equal(t, []*base.Reaction{
+		{
+			UserName: "lafriks",
+			UserID:   1241334,
+			Content:  "thumbsup",
+		},
+		{
+			UserName: "real6543",
+			UserID:   4575606,
+			Content:  "thumbsup",
+		},
+	}, reactions)
+}
+
+func TestNoteToComment(t *testing.T) {
+	downloader := &GitlabDownloader{}
+
+	now := time.Now()
+	for _, testCase := range []struct {
+		id          int64
+		body        string
+		system      bool
+		commentType string
+		meta        map[string]any
+	}{
+		{1, "This is a regular comment", false, "", map[string]any{}},
+		{2, "enabled an automatic merge for abcd1234", true, "pull_scheduled_merge", map[string]any{}},
+		{3, "changed target branch from `master` to `main`", true, "change_target_branch", map[string]any{"OldRef": "master", "NewRef": "main"}},
+		{4, "canceled the automatic merge", true, "pull_cancel_scheduled_merge", map[string]any{}},
+	} {
+		note := gitlab.Note{
+			ID: testCase.id,
+			Author: gitlab.NoteAuthor{
+				ID:       72,
+				Email:    "test@example.com",
+				Username: "test",
+			},
+			Body:      testCase.body,
+			CreatedAt: &now,
+			System:    testCase.system,
+		}
+		assert.Equal(t, base.Comment{
+			IssueIndex:  17,
+			Index:       testCase.id,
+			PosterID:    72,
+			PosterName:  "test",
+			PosterEmail: "test@example.com",
+			CommentType: testCase.commentType,
+			Content:     testCase.body,
+			Created:     now,
+			Meta:        testCase.meta,
+		}, *downloader.convertNoteToComment(17, &note))
+	}
+}
+
+func TestGitlabIIDResolver(t *testing.T) {
+	r := gitlabIIDResolver{}
+	r.recordIssueIID(1)
+	r.recordIssueIID(2)
+	r.recordIssueIID(3)
+	r.recordIssueIID(2)
+	assert.EqualValues(t, 4, r.generatePullRequestNumber(1))
+	assert.EqualValues(t, 13, r.generatePullRequestNumber(10))
+
+	assert.Panics(t, func() {
+		r := gitlabIIDResolver{}
+		r.recordIssueIID(1)
+		assert.EqualValues(t, 2, r.generatePullRequestNumber(1))
+		r.recordIssueIID(3) // the generation procedure has been started, it shouldn't accept any new issue IID, so it panics
+	})
 }

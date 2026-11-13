@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"code.gitea.io/gitea/modules/log"
+	"gitea.dev/modules/log"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -47,12 +47,12 @@ func (m *Manager) GetRedisClient(connection string) (client redis.UniversalClien
 	// Because we want associate any goroutines created by this call to the main nosqldb context we need to
 	// wrap this in a goroutine labelled with the nosqldb context
 	done := make(chan struct{})
-	var recovered interface{}
+	var recovered any
 	go func() {
 		defer func() {
 			recovered = recover()
 			if recovered != nil {
-				log.Critical("PANIC during GetRedisClient: %v\nStacktrace: %s", recovered, log.Stack(2))
+				log.Error("PANIC during GetRedisClient: %v\nStacktrace: %s", recovered, log.Stack(2))
 			}
 			close(done)
 		}()

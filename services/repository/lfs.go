@@ -9,17 +9,19 @@ import (
 	"fmt"
 	"time"
 
-	git_model "code.gitea.io/gitea/models/git"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/lfs"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
+	git_model "gitea.dev/models/git"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/lfs"
+	"gitea.dev/modules/log"
+	repo_module "gitea.dev/modules/repository"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
 )
 
 // GarbageCollectLFSMetaObjectsOptions provides options for GarbageCollectLFSMetaObjects function
 type GarbageCollectLFSMetaObjectsOptions struct {
-	Logger                   log.Logger
+	LogDetail                func(format string, v ...any)
 	AutoFix                  bool
 	OlderThan                time.Time
 	UpdatedLessRecentlyThan  time.Time
@@ -32,10 +34,12 @@ func GarbageCollectLFSMetaObjects(ctx context.Context, opts GarbageCollectLFSMet
 	log.Trace("Doing: GarbageCollectLFSMetaObjects")
 	defer log.Trace("Finished: GarbageCollectLFSMetaObjects")
 
+	if opts.LogDetail == nil {
+		opts.LogDetail = log.Debug
+	}
+
 	if !setting.LFS.StartServer {
-		if opts.Logger != nil {
-			opts.Logger.Info("LFS support is disabled")
-		}
+		opts.LogDetail("LFS support is disabled")
 		return nil
 	}
 
@@ -48,29 +52,28 @@ func GarbageCollectLFSMetaObjects(ctx context.Context, opts GarbageCollectLFSMet
 		if newMinimum := int64(float64(count) * opts.ProportionToCheckPerRepo); newMinimum > opts.NumberToCheckPerRepo && opts.NumberToCheckPerRepo != 0 {
 			opts.NumberToCheckPerRepo = newMinimum
 		}
-		return GarbageCollectLFSMetaObjectsForRepo(ctx, repo, opts)
+		if err := GarbageCollectLFSMetaObjectsForRepo(ctx, repo, opts); err != nil {
+			log.Error("Unable to garbage collect LFS meta objects in %-v: %v", repo, err)
+		}
+		return nil
 	})
 }
 
 // GarbageCollectLFSMetaObjectsForRepo garbage collects LFS objects for a specific repository
 func GarbageCollectLFSMetaObjectsForRepo(ctx context.Context, repo *repo_model.Repository, opts GarbageCollectLFSMetaObjectsOptions) error {
-	if opts.Logger != nil {
-		opts.Logger.Info("Checking %-v", repo)
-	}
+	opts.LogDetail("Checking %-v", repo)
 	total, orphaned, collected, deleted := int64(0), 0, 0, 0
-	if opts.Logger != nil {
-		defer func() {
-			if orphaned == 0 {
-				opts.Logger.Info("Found %d total LFSMetaObjects in %-v", total, repo)
-			} else if !opts.AutoFix {
-				opts.Logger.Info("Found %d/%d orphaned LFSMetaObjects in %-v", orphaned, total, repo)
-			} else {
-				opts.Logger.Info("Collected %d/%d orphaned/%d total LFSMetaObjects in %-v. %d removed from storage.", collected, orphaned, total, repo, deleted)
-			}
-		}()
-	}
+	defer func() {
+		if orphaned == 0 {
+			opts.LogDetail("Found %d total LFSMetaObjects in %-v", total, repo)
+		} else if !opts.AutoFix {
+			opts.LogDetail("Found %d/%d orphaned LFSMetaObjects in %-v", orphaned, total, repo)
+		} else {
+			opts.LogDetail("Collected %d/%d orphaned/%d total LFSMetaObjects in %-v. %d removed from storage.", collected, orphaned, total, repo, deleted)
+		}
+	}()
 
-	gitRepo, err := git.OpenRepository(ctx, repo.RepoPath())
+	gitRepo, err := git.OpenRepository(ctx, repo)
 	if err != nil {
 		log.Error("Unable to open git repository %-v: %v", repo, err)
 		return err
@@ -79,15 +82,16 @@ func GarbageCollectLFSMetaObjectsForRepo(ctx context.Context, repo *repo_model.R
 
 	store := lfs.NewContentStore()
 	errStop := errors.New("STOPERR")
+	objectFormat := git.ObjectFormatFromName(repo.ObjectFormatName)
 
 	err = git_model.IterateLFSMetaObjectsForRepo(ctx, repo.ID, func(ctx context.Context, metaObject *git_model.LFSMetaObject, count int64) error {
 		if opts.NumberToCheckPerRepo > 0 && total > opts.NumberToCheckPerRepo {
 			return errStop
 		}
 		total++
-		pointerSha := git.ComputeBlobHash([]byte(metaObject.Pointer.StringContent()))
+		pointerSha := git.ComputeBlobHash(objectFormat, []byte(metaObject.Pointer.StringContent()))
 
-		if gitRepo.IsObjectExist(pointerSha.String()) {
+		if gitRepo.IsObjectExist(ctx, pointerSha.String()) {
 			return git_model.MarkLFSMetaObject(ctx, metaObject.ID)
 		}
 		orphaned++
@@ -101,7 +105,7 @@ func GarbageCollectLFSMetaObjectsForRepo(ctx context.Context, repo *repo_model.R
 				return nil
 			}
 
-			if err := store.Delete(metaObject.RelativePath()); err != nil {
+			if err := store.ObjectStorage.Delete(metaObject.RelativePath()); err != nil {
 				log.Error("Unable to remove lfs metaobject %s from store: %v", metaObject.Oid, err)
 			}
 			deleted++
@@ -122,19 +126,21 @@ func GarbageCollectLFSMetaObjectsForRepo(ctx context.Context, repo *repo_model.R
 		//
 		// It is likely that a week is potentially excessive but it should definitely be enough that any
 		// unassociated LFS object is genuinely unassociated.
-		OlderThan:                 opts.OlderThan,
-		UpdatedLessRecentlyThan:   opts.UpdatedLessRecentlyThan,
-		OrderByUpdated:            true,
-		LoopFunctionAlwaysUpdates: true,
+		OlderThan:               timeutil.TimeStamp(opts.OlderThan.Unix()),
+		UpdatedLessRecentlyThan: timeutil.TimeStamp(opts.UpdatedLessRecentlyThan.Unix()),
 	})
 
 	if err == errStop {
-		if opts.Logger != nil {
-			opts.Logger.Info("Processing stopped at %d total LFSMetaObjects in %-v", total, repo)
-		}
-		return nil
+		opts.LogDetail("Processing stopped at %d total LFSMetaObjects in %-v", total, repo)
 	} else if err != nil {
 		return err
 	}
+
+	if collected > 0 {
+		if err := repo_module.UpdateRepoSize(ctx, repo); err != nil {
+			return fmt.Errorf("unable to update size for %s: %w", repo.FullName(), err)
+		}
+	}
+
 	return nil
 }

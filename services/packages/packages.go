@@ -8,19 +8,24 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
+	"net/http"
+	"net/url"
 	"strings"
 
-	"code.gitea.io/gitea/models/db"
-	packages_model "code.gitea.io/gitea/models/packages"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/notification"
-	packages_module "code.gitea.io/gitea/modules/packages"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	packages_model "gitea.dev/models/packages"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/globallock"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	packages_module "gitea.dev/modules/packages"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/storage"
+	notify_service "gitea.dev/services/notify"
 )
 
 var (
@@ -28,6 +33,15 @@ var (
 	ErrQuotaTotalSize  = errors.New("maximum allowed package storage quota exceeded")
 	ErrQuotaTotalCount = errors.New("maximum allowed package count exceeded")
 )
+
+type Specialization interface {
+	PublicPropertyNames() []string // only properties locating the file, the others are internal and can be large
+	OnBeforeRemovePackageAll(ctx context.Context, doer *user_model.User, pkg *packages_model.Package, pds []*packages_model.PackageDescriptor) error
+	OnBeforeRemovePackageVersion(ctx context.Context, doer *user_model.User, pd *packages_model.PackageDescriptor) error
+	OnAfterRemovePackage(ctx context.Context, pkg *packages_model.Package) error // called after the package or one of its versions was removed
+	GetViewPackageVersionData(ctx context.Context, pd *packages_model.PackageDescriptor) (any, error)
+	RenderSetupManual(ctx context.Context, pkg *packages_model.PackageDescriptor, viewData any) template.HTML
+}
 
 // PackageInfo describes a package
 type PackageInfo struct {
@@ -42,7 +56,7 @@ type PackageCreationInfo struct {
 	PackageInfo
 	SemverCompatible  bool
 	Creator           *user_model.User
-	Metadata          interface{}
+	Metadata          any
 	PackageProperties map[string]string
 	VersionProperties map[string]string
 }
@@ -64,28 +78,33 @@ type PackageFileCreationInfo struct {
 }
 
 // CreatePackageAndAddFile creates a package with a file. If the same package exists already, ErrDuplicatePackageVersion is returned
-func CreatePackageAndAddFile(pvci *PackageCreationInfo, pfci *PackageFileCreationInfo) (*packages_model.PackageVersion, *packages_model.PackageFile, error) {
-	return createPackageAndAddFile(pvci, pfci, false)
+func CreatePackageAndAddFile(ctx context.Context, pvci *PackageCreationInfo, pfci *PackageFileCreationInfo) (*packages_model.PackageVersion, *packages_model.PackageFile, error) {
+	return createPackageAndAddFile(ctx, pvci, pfci, false)
 }
 
 // CreatePackageOrAddFileToExisting creates a package with a file or adds the file if the package exists already
-func CreatePackageOrAddFileToExisting(pvci *PackageCreationInfo, pfci *PackageFileCreationInfo) (*packages_model.PackageVersion, *packages_model.PackageFile, error) {
-	return createPackageAndAddFile(pvci, pfci, true)
+func CreatePackageOrAddFileToExisting(ctx context.Context, pvci *PackageCreationInfo, pfci *PackageFileCreationInfo) (pv *packages_model.PackageVersion, pf *packages_model.PackageFile, err error) {
+	lockKey := fmt.Sprintf("pkg-upsert-%v-%v-%v", pvci.PackageType, pvci.Name, pvci.Version)
+	err = globallock.LockAndDo(ctx, lockKey, func(ctx context.Context) error {
+		pv, pf, err = createPackageAndAddFile(ctx, pvci, pfci, true)
+		return err
+	})
+	return pv, pf, err
 }
 
-func createPackageAndAddFile(pvci *PackageCreationInfo, pfci *PackageFileCreationInfo, allowDuplicate bool) (*packages_model.PackageVersion, *packages_model.PackageFile, error) {
-	ctx, committer, err := db.TxContext(db.DefaultContext)
+func createPackageAndAddFile(ctx context.Context, pvci *PackageCreationInfo, pfci *PackageFileCreationInfo, allowDuplicate bool) (*packages_model.PackageVersion, *packages_model.PackageFile, error) {
+	dbCtx, committer, err := db.TxContext(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer committer.Close()
 
-	pv, created, err := createPackageAndVersion(ctx, pvci, allowDuplicate)
+	pv, created, err := createPackageAndVersion(dbCtx, pvci, allowDuplicate)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	pf, pb, blobCreated, err := addFileToPackageVersion(ctx, pv, &pvci.PackageInfo, pfci)
+	pf, pb, blobCreated, err := addFileToPackageVersion(dbCtx, pv, &pvci.PackageInfo, pfci)
 	removeBlob := false
 	defer func() {
 		if blobCreated && removeBlob {
@@ -106,12 +125,12 @@ func createPackageAndAddFile(pvci *PackageCreationInfo, pfci *PackageFileCreatio
 	}
 
 	if created {
-		pd, err := packages_model.GetPackageDescriptor(db.DefaultContext, pv)
+		pd, err := packages_model.GetPackageDescriptor(ctx, pv)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		notification.NotifyPackageCreate(db.DefaultContext, pvci.Creator, pd)
+		notify_service.PackageCreate(ctx, pvci.Creator, pd)
 	}
 
 	return pv, pf, nil
@@ -130,12 +149,11 @@ func createPackageAndVersion(ctx context.Context, pvci *PackageCreationInfo, all
 	}
 	var err error
 	if p, err = packages_model.TryInsertPackage(ctx, p); err != nil {
-		if err == packages_model.ErrDuplicatePackage {
-			packageCreated = false
-		} else {
+		if !errors.Is(err, packages_model.ErrDuplicatePackage) {
 			log.Error("Error inserting package: %v", err)
 			return nil, false, err
 		}
+		packageCreated = false
 	}
 
 	if packageCreated {
@@ -161,11 +179,10 @@ func createPackageAndVersion(ctx context.Context, pvci *PackageCreationInfo, all
 		MetadataJSON: string(metadataJSON),
 	}
 	if pv, err = packages_model.GetOrInsertVersion(ctx, pv); err != nil {
-		if err == packages_model.ErrDuplicatePackageVersion {
+		if errors.Is(err, packages_model.ErrDuplicatePackageVersion) && allowDuplicate {
 			versionCreated = false
-		}
-		if err != packages_model.ErrDuplicatePackageVersion || !allowDuplicate {
-			log.Error("Error inserting package: %v", err)
+		} else {
+			log.Error("Error inserting package: %v", err) // other error, or disallowing duplicates
 			return nil, false, err
 		}
 	}
@@ -187,19 +204,33 @@ func createPackageAndVersion(ctx context.Context, pvci *PackageCreationInfo, all
 }
 
 // AddFileToExistingPackage adds a file to an existing package. If the package does not exist, ErrPackageNotExist is returned
-func AddFileToExistingPackage(pvi *PackageInfo, pfci *PackageFileCreationInfo) (*packages_model.PackageVersion, *packages_model.PackageFile, error) {
-	ctx, committer, err := db.TxContext(db.DefaultContext)
+func AddFileToExistingPackage(ctx context.Context, pvi *PackageInfo, pfci *PackageFileCreationInfo) (*packages_model.PackageFile, error) {
+	return addFileToPackageWrapper(ctx, func(ctx context.Context) (*packages_model.PackageFile, *packages_model.PackageBlob, bool, error) {
+		pv, err := packages_model.GetVersionByNameAndVersion(ctx, pvi.Owner.ID, pvi.PackageType, pvi.Name, pvi.Version)
+		if err != nil {
+			return nil, nil, false, err
+		}
+
+		return addFileToPackageVersion(ctx, pv, pvi, pfci)
+	})
+}
+
+// AddFileToPackageVersionInternal adds a file to the package
+// This method skips quota checks and should only be used for system-managed packages.
+func AddFileToPackageVersionInternal(ctx context.Context, pv *packages_model.PackageVersion, pfci *PackageFileCreationInfo) (*packages_model.PackageFile, error) {
+	return addFileToPackageWrapper(ctx, func(ctx context.Context) (*packages_model.PackageFile, *packages_model.PackageBlob, bool, error) {
+		return addFileToPackageVersionUnchecked(ctx, pv, pfci)
+	})
+}
+
+func addFileToPackageWrapper(ctx context.Context, fn func(ctx context.Context) (*packages_model.PackageFile, *packages_model.PackageBlob, bool, error)) (*packages_model.PackageFile, error) {
+	ctx, committer, err := db.TxContext(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer committer.Close()
 
-	pv, err := packages_model.GetVersionByNameAndVersion(ctx, pvi.Owner.ID, pvi.PackageType, pvi.Name, pvi.Version)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	pf, pb, blobCreated, err := addFileToPackageVersion(ctx, pv, pvi, pfci)
+	pf, pb, blobCreated, err := fn(ctx)
 	removeBlob := false
 	defer func() {
 		if removeBlob {
@@ -211,15 +242,15 @@ func AddFileToExistingPackage(pvi *PackageInfo, pfci *PackageFileCreationInfo) (
 	}()
 	if err != nil {
 		removeBlob = blobCreated
-		return nil, nil, err
+		return nil, err
 	}
 
 	if err := committer.Commit(); err != nil {
 		removeBlob = blobCreated
-		return nil, nil, err
+		return nil, err
 	}
 
-	return pv, pf, nil
+	return pf, nil
 }
 
 // NewPackageBlob creates a package blob instance
@@ -235,24 +266,56 @@ func NewPackageBlob(hsr packages_module.HashedSizeReader) *packages_model.Packag
 	}
 }
 
-func addFileToPackageVersion(ctx context.Context, pv *packages_model.PackageVersion, pvi *PackageInfo, pfci *PackageFileCreationInfo) (*packages_model.PackageFile, *packages_model.PackageBlob, bool, error) {
-	log.Trace("Adding package file: %v, %s", pv.ID, pfci.Filename)
+func GetOrSavePackageBlob(ctx context.Context, contentStore *packages_module.ContentStore, blob *packages_model.PackageBlob, data packages_module.HashedSizeReader) (_ *packages_model.PackageBlob, _ bool, retErr error) {
+	if blob.Size != data.Size() {
+		return nil, false, fmt.Errorf("size mismatch: blob size %d, data size %d", blob.Size, data.Size())
+	}
+	pb, existsInDatabase, err := packages_model.GetOrInsertBlob(ctx, blob)
+	if err != nil {
+		return nil, false, fmt.Errorf("unable to get or insert blob: %w", err)
+	}
 
+	defer func() {
+		if retErr != nil && !existsInDatabase {
+			if errDelete := packages_model.DeleteBlobByID(ctx, pb.ID); errDelete != nil {
+				log.Error("unable to delete blob from database after failed save in content store: %v", errDelete)
+			}
+		}
+	}()
+
+	var objSize optional.Option[int64]
+	storeKey := packages_module.BlobHash256Key(pb.HashSHA256)
+	if existsInDatabase {
+		// check if the blob file actually is valid in the content store
+		objSize, err = contentStore.OptionalSize(storeKey)
+		if err != nil {
+			return nil, false, fmt.Errorf("unable to check object size in content store: %w", err)
+		}
+	}
+	if objSize.ValueOrDefault(-1) != blob.Size {
+		if err := contentStore.Save(storeKey, data, data.Size()); err != nil {
+			return nil, false, fmt.Errorf("unable to save object in content store: %w", err)
+		}
+	}
+	// existsInDatabase controls the "roll back", if other errors happen later,
+	// the "non-existing (newly created)" blob will be deleted from the content store, but not if it already existed in the database.
+	return pb, existsInDatabase, nil
+}
+
+func addFileToPackageVersion(ctx context.Context, pv *packages_model.PackageVersion, pvi *PackageInfo, pfci *PackageFileCreationInfo) (*packages_model.PackageFile, *packages_model.PackageBlob, bool, error) {
 	if err := CheckSizeQuotaExceeded(ctx, pfci.Creator, pvi.Owner, pvi.PackageType, pfci.Data.Size()); err != nil {
 		return nil, nil, false, err
 	}
 
-	pb, exists, err := packages_model.GetOrInsertBlob(ctx, NewPackageBlob(pfci.Data))
+	return addFileToPackageVersionUnchecked(ctx, pv, pfci)
+}
+
+func addFileToPackageVersionUnchecked(ctx context.Context, pv *packages_model.PackageVersion, pfci *PackageFileCreationInfo) (_ *packages_model.PackageFile, _ *packages_model.PackageBlob, created bool, _ error) {
+	log.Trace("Adding package file: %v, %s", pv.ID, pfci.Filename)
+
+	pb, exists, err := GetOrSavePackageBlob(ctx, packages_module.NewContentStore(), NewPackageBlob(pfci.Data), pfci.Data)
 	if err != nil {
-		log.Error("Error inserting package blob: %v", err)
 		return nil, nil, false, err
-	}
-	if !exists {
-		contentStore := packages_module.NewContentStore()
-		if err := contentStore.Save(packages_module.BlobHash256Key(pb.HashSHA256), pfci.Data, pfci.Data.Size()); err != nil {
-			log.Error("Error saving package blob in content store: %v", err)
-			return nil, nil, false, err
-		}
 	}
 
 	if pfci.OverwriteExisting {
@@ -310,7 +373,7 @@ func CheckCountQuotaExceeded(ctx context.Context, doer, owner *user_model.User) 
 	if setting.Packages.LimitTotalOwnerCount > -1 {
 		totalCount, err := packages_model.CountVersions(ctx, &packages_model.PackageSearchOptions{
 			OwnerID:    owner.ID,
-			IsInternal: util.OptionalBoolFalse,
+			IsInternal: optional.Some(false),
 		})
 		if err != nil {
 			log.Error("CountVersions failed: %v", err)
@@ -333,6 +396,10 @@ func CheckSizeQuotaExceeded(ctx context.Context, doer, owner *user_model.User, p
 
 	var typeSpecificSize int64
 	switch packageType {
+	case packages_model.TypeAlpine:
+		typeSpecificSize = setting.Packages.LimitSizeAlpine
+	case packages_model.TypeArch:
+		typeSpecificSize = setting.Packages.LimitSizeArch
 	case packages_model.TypeCargo:
 		typeSpecificSize = setting.Packages.LimitSizeCargo
 	case packages_model.TypeChef:
@@ -345,8 +412,14 @@ func CheckSizeQuotaExceeded(ctx context.Context, doer, owner *user_model.User, p
 		typeSpecificSize = setting.Packages.LimitSizeConda
 	case packages_model.TypeContainer:
 		typeSpecificSize = setting.Packages.LimitSizeContainer
+	case packages_model.TypeCran:
+		typeSpecificSize = setting.Packages.LimitSizeCran
+	case packages_model.TypeDebian:
+		typeSpecificSize = setting.Packages.LimitSizeDebian
 	case packages_model.TypeGeneric:
 		typeSpecificSize = setting.Packages.LimitSizeGeneric
+	case packages_model.TypeGo:
+		typeSpecificSize = setting.Packages.LimitSizeGo
 	case packages_model.TypeHelm:
 		typeSpecificSize = setting.Packages.LimitSizeHelm
 	case packages_model.TypeMaven:
@@ -359,10 +432,16 @@ func CheckSizeQuotaExceeded(ctx context.Context, doer, owner *user_model.User, p
 		typeSpecificSize = setting.Packages.LimitSizePub
 	case packages_model.TypePyPI:
 		typeSpecificSize = setting.Packages.LimitSizePyPI
+	case packages_model.TypeRpm:
+		typeSpecificSize = setting.Packages.LimitSizeRpm
 	case packages_model.TypeRubyGems:
 		typeSpecificSize = setting.Packages.LimitSizeRubyGems
 	case packages_model.TypeSwift:
 		typeSpecificSize = setting.Packages.LimitSizeSwift
+	case packages_model.TypeTerraformModule:
+		typeSpecificSize = setting.Packages.LimitSizeTerraformModule
+	case packages_model.TypeTerraformState:
+		typeSpecificSize = setting.Packages.LimitSizeTerraformState
 	case packages_model.TypeVagrant:
 		typeSpecificSize = setting.Packages.LimitSizeVagrant
 	}
@@ -386,40 +465,117 @@ func CheckSizeQuotaExceeded(ctx context.Context, doer, owner *user_model.User, p
 	return nil
 }
 
+// GetOrCreateInternalPackageVersion gets or creates an internal package
+// Some package types need such internal packages for housekeeping.
+func GetOrCreateInternalPackageVersion(ctx context.Context, ownerID int64, packageType packages_model.Type, name, version string) (*packages_model.PackageVersion, error) {
+	var pv *packages_model.PackageVersion
+
+	return pv, db.WithTx(ctx, func(ctx context.Context) error {
+		p := &packages_model.Package{
+			OwnerID:    ownerID,
+			Type:       packageType,
+			Name:       name,
+			LowerName:  name,
+			IsInternal: true,
+		}
+		var err error
+		if p, err = packages_model.TryInsertPackage(ctx, p); err != nil {
+			if !errors.Is(err, packages_model.ErrDuplicatePackage) {
+				log.Error("Error inserting package: %v", err)
+				return err
+			}
+		}
+
+		pv = &packages_model.PackageVersion{
+			PackageID:    p.ID,
+			CreatorID:    ownerID,
+			Version:      version,
+			LowerVersion: version,
+			IsInternal:   true,
+			MetadataJSON: "null",
+		}
+		if pv, err = packages_model.GetOrInsertVersion(ctx, pv); err != nil {
+			if err != packages_model.ErrDuplicatePackageVersion {
+				log.Error("Error inserting package version: %v", err)
+				return err
+			}
+		}
+
+		return nil
+	})
+}
+
 // RemovePackageVersionByNameAndVersion deletes a package version and all associated files
-func RemovePackageVersionByNameAndVersion(doer *user_model.User, pvi *PackageInfo) error {
-	pv, err := packages_model.GetVersionByNameAndVersion(db.DefaultContext, pvi.Owner.ID, pvi.PackageType, pvi.Name, pvi.Version)
+func RemovePackageVersionByNameAndVersion(ctx context.Context, doer *user_model.User, pvi *PackageInfo) error {
+	pv, err := packages_model.GetVersionByNameAndVersion(ctx, pvi.Owner.ID, pvi.PackageType, pvi.Name, pvi.Version)
 	if err != nil {
 		return err
 	}
 
-	return RemovePackageVersion(doer, pv)
+	return RemovePackageVersion(ctx, doer, pv)
 }
 
 // RemovePackageVersion deletes the package version and all associated files
-func RemovePackageVersion(doer *user_model.User, pv *packages_model.PackageVersion) error {
-	ctx, committer, err := db.TxContext(db.DefaultContext)
-	if err != nil {
-		return err
-	}
-	defer committer.Close()
-
+func RemovePackageVersion(ctx context.Context, doer *user_model.User, pv *packages_model.PackageVersion) error {
 	pd, err := packages_model.GetPackageDescriptor(ctx, pv)
 	if err != nil {
 		return err
 	}
-
-	log.Trace("Deleting package: %v", pv.ID)
-
-	if err := DeletePackageVersionAndReferences(ctx, pv); err != nil {
+	spec := GetSpecManager().Get(pd.Package.Type)
+	if err := spec.OnBeforeRemovePackageVersion(ctx, doer, pd); err != nil {
+		return err
+	}
+	// HINT: PACKAGE-DEFER-STORAGE-DELETE: Blobs are not deleted immediately, instead they are deleted by the cleanup_packages cron task.
+	// If there are no more versions for the package, the same task removes that as well.
+	if err := db.WithTx(ctx, func(ctx context.Context) error {
+		log.Trace("Deleting package: %v", pv.ID)
+		return DeletePackageVersionAndReferences(ctx, pv)
+	}); err != nil {
 		return err
 	}
 
-	if err := committer.Commit(); err != nil {
+	notify_service.PackageDelete(ctx, doer, pd)
+
+	return spec.OnAfterRemovePackage(ctx, pd.Package)
+}
+
+// RemovePackageFileAndVersionIfUnreferenced deletes the package file and the version if there are no referenced files afterwards
+func RemovePackageFileAndVersionIfUnreferenced(ctx context.Context, doer *user_model.User, pf *packages_model.PackageFile) error {
+	var pd *packages_model.PackageDescriptor
+
+	if err := db.WithTx(ctx, func(ctx context.Context) error {
+		if err := DeletePackageFile(ctx, pf); err != nil {
+			return err
+		}
+
+		has, err := packages_model.HasVersionFileReferences(ctx, pf.VersionID)
+		if err != nil {
+			return err
+		}
+		if !has {
+			pv, err := packages_model.GetVersionByID(ctx, pf.VersionID)
+			if err != nil {
+				return err
+			}
+
+			pd, err = packages_model.GetPackageDescriptor(ctx, pv)
+			if err != nil {
+				return err
+			}
+
+			if err := DeletePackageVersionAndReferences(ctx, pv); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}); err != nil {
 		return err
 	}
 
-	notification.NotifyPackageDelete(db.DefaultContext, doer, pd)
+	if pd != nil {
+		notify_service.PackageDelete(ctx, doer, pd)
+	}
 
 	return nil
 }
@@ -429,16 +585,11 @@ func DeletePackageVersionAndReferences(ctx context.Context, pv *packages_model.P
 	if err := packages_model.DeleteAllProperties(ctx, packages_model.PropertyTypeVersion, pv.ID); err != nil {
 		return err
 	}
-
-	pfs, err := packages_model.GetFilesByVersionID(ctx, pv.ID)
-	if err != nil {
+	if err := packages_model.DeleteFilePropertiesByVersionID(ctx, pv.ID); err != nil {
 		return err
 	}
-
-	for _, pf := range pfs {
-		if err := DeletePackageFile(ctx, pf); err != nil {
-			return err
-		}
+	if err := packages_model.DeleteFilesByVersionID(ctx, pv.ID); err != nil {
+		return err
 	}
 
 	return packages_model.DeleteVersionByID(ctx, pv.ID)
@@ -452,79 +603,123 @@ func DeletePackageFile(ctx context.Context, pf *packages_model.PackageFile) erro
 	return packages_model.DeleteFileByID(ctx, pf.ID)
 }
 
-// GetFileStreamByPackageNameAndVersion returns the content of the specific package file
-func GetFileStreamByPackageNameAndVersion(ctx context.Context, pvi *PackageInfo, pfi *PackageFileInfo) (io.ReadSeekCloser, *packages_model.PackageFile, error) {
+// OpenFileForDownloadByPackageNameAndVersion returns the content of the specific package file and increases the download counter.
+func OpenFileForDownloadByPackageNameAndVersion(ctx context.Context, pvi *PackageInfo, pfi *PackageFileInfo, method string) (io.ReadSeekCloser, *url.URL, *packages_model.PackageFile, error) {
 	log.Trace("Getting package file stream: %v, %v, %s, %s, %s, %s", pvi.Owner.ID, pvi.PackageType, pvi.Name, pvi.Version, pfi.Filename, pfi.CompositeKey)
 
 	pv, err := packages_model.GetVersionByNameAndVersion(ctx, pvi.Owner.ID, pvi.PackageType, pvi.Name, pvi.Version)
 	if err != nil {
 		if err == packages_model.ErrPackageNotExist {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		log.Error("Error getting package: %v", err)
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	return GetFileStreamByPackageVersion(ctx, pv, pfi)
+	return OpenFileForDownloadByPackageVersion(ctx, pv, pfi, method)
 }
 
-// GetFileStreamByPackageVersionAndFileID returns the content of the specific package file
-func GetFileStreamByPackageVersionAndFileID(ctx context.Context, owner *user_model.User, versionID, fileID int64) (io.ReadSeekCloser, *packages_model.PackageFile, error) {
-	log.Trace("Getting package file stream: %v, %v, %v", owner.ID, versionID, fileID)
-
-	pv, err := packages_model.GetVersionByID(ctx, versionID)
-	if err != nil {
-		if err != packages_model.ErrPackageNotExist {
-			log.Error("Error getting package version: %v", err)
-		}
-		return nil, nil, err
-	}
-
-	p, err := packages_model.GetPackageByID(ctx, pv.PackageID)
-	if err != nil {
-		log.Error("Error getting package: %v", err)
-		return nil, nil, err
-	}
-
-	if p.OwnerID != owner.ID {
-		return nil, nil, packages_model.ErrPackageNotExist
-	}
-
-	pf, err := packages_model.GetFileForVersionByID(ctx, versionID, fileID)
-	if err != nil {
-		log.Error("Error getting file: %v", err)
-		return nil, nil, err
-	}
-
-	return GetPackageFileStream(ctx, pf)
-}
-
-// GetFileStreamByPackageVersion returns the content of the specific package file
-func GetFileStreamByPackageVersion(ctx context.Context, pv *packages_model.PackageVersion, pfi *PackageFileInfo) (io.ReadSeekCloser, *packages_model.PackageFile, error) {
+// OpenFileForDownloadByPackageVersion returns the content of the specific package file and increases the download counter.
+func OpenFileForDownloadByPackageVersion(ctx context.Context, pv *packages_model.PackageVersion, pfi *PackageFileInfo, method string) (io.ReadSeekCloser, *url.URL, *packages_model.PackageFile, error) {
 	pf, err := packages_model.GetFileForVersionByName(ctx, pv.ID, pfi.Filename, pfi.CompositeKey)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	return GetPackageFileStream(ctx, pf)
+	return OpenFileForDownload(ctx, pf, method)
 }
 
-// GetPackageFileStream returns the content of the specific package file
-func GetPackageFileStream(ctx context.Context, pf *packages_model.PackageFile) (io.ReadSeekCloser, *packages_model.PackageFile, error) {
+// OpenFileForDownload returns the content of the specific package file and increases the download counter.
+func OpenFileForDownload(ctx context.Context, pf *packages_model.PackageFile, method string) (io.ReadSeekCloser, *url.URL, *packages_model.PackageFile, error) {
 	pb, err := packages_model.GetBlobByID(ctx, pf.BlobID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	s, err := packages_module.NewContentStore().Get(packages_module.BlobHash256Key(pb.HashSHA256))
-	if err == nil {
-		if pf.IsLead {
-			if err := packages_model.IncrementDownloadCounter(ctx, pf.VersionID); err != nil {
-				log.Error("Error incrementing download counter: %v", err)
-			}
+	return OpenBlobForDownload(ctx, pf, pb, method, nil)
+}
+
+func OpenBlobStream(pb *packages_model.PackageBlob) (io.ReadSeekCloser, error) {
+	cs := packages_module.NewContentStore()
+	key := packages_module.BlobHash256Key(pb.HashSHA256)
+	return cs.OpenBlob(key)
+}
+
+// OpenBlobForDownload returns the content of the specific package blob and increases the download counter.
+// If the storage supports direct serving and it's enabled, only the direct serving url is returned.
+func OpenBlobForDownload(ctx context.Context, pf *packages_model.PackageFile, pb *packages_model.PackageBlob, method string, serveDirectReqParams *storage.ServeDirectOptions) (io.ReadSeekCloser, *url.URL, *packages_model.PackageFile, error) {
+	key := packages_module.BlobHash256Key(pb.HashSHA256)
+
+	cs := packages_module.NewContentStore()
+
+	var s io.ReadSeekCloser
+	var u *url.URL
+	var err error
+
+	if cs.ShouldServeDirect() {
+		u, err = cs.GetServeDirectURL(key, pf.Name, method, serveDirectReqParams)
+		if err != nil && !errors.Is(err, storage.ErrURLNotSupported) {
+			log.Error("Error getting serve direct url (fallback to local reader): %v", err)
 		}
 	}
-	return s, pf, err
+	if u == nil {
+		s, err = cs.OpenBlob(key)
+	}
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	if pf.IsLead && method == http.MethodGet {
+		if err := packages_model.IncrementDownloadCounter(ctx, pf.VersionID); err != nil {
+			log.Error("Error incrementing download counter: %v", err)
+		}
+	}
+	return s, u, pf, nil
+}
+
+// RemovePackage deletes the package and all its versions
+func RemovePackage(ctx context.Context, doer *user_model.User, p *packages_model.Package) error {
+	pds, err := packages_model.GetAllPackageDescriptors(ctx, p)
+	if err != nil {
+		return err
+	}
+	spec := GetSpecManager().Get(p.Type)
+	if err := spec.OnBeforeRemovePackageAll(ctx, doer, p, pds); err != nil {
+		return err
+	}
+
+	// HINT: PACKAGE-DEFER-STORAGE-DELETE: Blobs are not deleted immediately, instead they are deleted by cleanup_packages cron task.
+	err = db.WithTx(ctx, func(ctx context.Context) error {
+		err := packages_model.DeletePropertiesByPackageID(ctx, packages_model.PropertyTypePackage, p.ID)
+		if err != nil {
+			return err
+		}
+		err = packages_model.DeletePropertiesByPackageID(ctx, packages_model.PropertyTypeFile, p.ID)
+		if err != nil {
+			return err
+		}
+		err = packages_model.DeletePropertiesByPackageID(ctx, packages_model.PropertyTypeVersion, p.ID)
+		if err != nil {
+			return err
+		}
+		err = packages_model.DeleteFilesByPackageID(ctx, p.ID)
+		if err != nil {
+			return err
+		}
+		err = packages_model.DeleteVersionsByPackageID(ctx, p.ID)
+		if err != nil {
+			return err
+		}
+
+		return packages_model.DeletePackageByID(ctx, p.ID)
+	})
+	if err != nil {
+		return err
+	}
+	for _, pd := range pds {
+		notify_service.PackageDelete(ctx, doer, pd)
+	}
+	return spec.OnAfterRemovePackage(ctx, p)
 }
 
 // RemoveAllPackages for User
@@ -537,7 +732,7 @@ func RemoveAllPackages(ctx context.Context, userID int64) (int, error) {
 				Page:     1,
 			},
 			OwnerID:    userID,
-			IsInternal: util.OptionalBoolNone,
+			IsInternal: optional.None[bool](),
 		})
 		if err != nil {
 			return count, fmt.Errorf("GetOwnedPackages[%d]: %w", userID, err)

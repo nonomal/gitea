@@ -7,10 +7,11 @@ import (
 	"net/http"
 	"strings"
 
-	activities_model "code.gitea.io/gitea/models/activities"
-	"code.gitea.io/gitea/modules/context"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/routers/api/v1/utils"
+	activities_model "gitea.dev/models/activities"
+	"gitea.dev/models/db"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
 )
 
 // NewAvailable check if unread notifications exist
@@ -21,13 +22,23 @@ func NewAvailable(ctx *context.APIContext) {
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/NotificationCount"
-	ctx.JSON(http.StatusOK, api.NotificationCount{New: activities_model.CountUnread(ctx, ctx.Doer.ID)})
+
+	total, err := db.Count[activities_model.Notification](ctx, activities_model.FindNotificationOptions{
+		UserID: ctx.Doer.ID,
+		Status: []activities_model.NotificationStatus{activities_model.NotificationStatusUnread},
+	})
+	if err != nil {
+		ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	ctx.JSON(http.StatusOK, api.NotificationCount{New: total})
 }
 
 func getFindNotificationOptions(ctx *context.APIContext) *activities_model.FindNotificationOptions {
-	before, since, err := context.GetQueryBeforeSince(ctx.Context)
+	before, since, err := context.GetQueryBeforeSince(ctx.Base)
 	if err != nil {
-		ctx.Error(http.StatusUnprocessableEntity, "GetQueryBeforeSince", err)
+		ctx.APIError(http.StatusUnprocessableEntity, err.Error())
 		return nil
 	}
 	opts := &activities_model.FindNotificationOptions{

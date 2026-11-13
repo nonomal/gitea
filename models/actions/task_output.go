@@ -6,7 +6,7 @@ package actions
 import (
 	"context"
 
-	"code.gitea.io/gitea/models/db"
+	"gitea.dev/models/db"
 )
 
 // ActionTaskOutput represents an output of ActionTask.
@@ -18,6 +18,10 @@ type ActionTaskOutput struct {
 	TaskID      int64  `xorm:"INDEX UNIQUE(task_id_output_key)"`
 	OutputKey   string `xorm:"VARCHAR(255) UNIQUE(task_id_output_key)"`
 	OutputValue string `xorm:"MEDIUMTEXT"`
+}
+
+func init() {
+	db.RegisterModel(new(ActionTaskOutput))
 }
 
 // FindTaskOutputByTaskID returns the outputs of the task.

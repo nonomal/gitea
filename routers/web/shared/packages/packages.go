@@ -8,23 +8,22 @@ import (
 	"net/http"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	packages_model "code.gitea.io/gitea/models/packages"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/forms"
-	cargo_service "code.gitea.io/gitea/services/packages/cargo"
-	container_service "code.gitea.io/gitea/services/packages/container"
+	packages_model "gitea.dev/models/packages"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/context"
+	"gitea.dev/services/forms"
+	cargo_service "gitea.dev/services/packages/cargo"
+	container_service "gitea.dev/services/packages/container"
 )
 
 func SetPackagesContext(ctx *context.Context, owner *user_model.User) {
 	pcrs, err := packages_model.GetCleanupRulesByOwner(ctx, owner.ID)
 	if err != nil {
-		ctx.ServerError("GetCleanupRulesByOwner", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
@@ -54,21 +53,21 @@ func setRuleEditContext(ctx *context.Context, pcr *packages_model.PackageCleanup
 	ctx.Data["AvailableTypes"] = packages_model.TypeList
 }
 
-func PerformRuleAddPost(ctx *context.Context, owner *user_model.User, redirectURL string, template base.TplName) {
+func PerformRuleAddPost(ctx *context.Context, owner *user_model.User, redirectURL string, template templates.TplName) {
 	performRuleEditPost(ctx, owner, nil, redirectURL, template)
 }
 
-func PerformRuleEditPost(ctx *context.Context, owner *user_model.User, redirectURL string, template base.TplName) {
+func PerformRuleEditPost(ctx *context.Context, owner *user_model.User, redirectURL string, template templates.TplName) {
 	pcr := getCleanupRuleByContext(ctx, owner)
 	if pcr == nil {
 		return
 	}
 
-	form := web.GetForm(ctx).(*forms.PackageCleanupRuleForm)
+	form := web.GetForm[*forms.PackageCleanupRuleForm](ctx)
 
 	if form.Action == "remove" {
 		if err := packages_model.DeleteCleanupRuleByID(ctx, pcr.ID); err != nil {
-			ctx.ServerError("DeleteCleanupRuleByID", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 
@@ -79,14 +78,14 @@ func PerformRuleEditPost(ctx *context.Context, owner *user_model.User, redirectU
 	}
 }
 
-func performRuleEditPost(ctx *context.Context, owner *user_model.User, pcr *packages_model.PackageCleanupRule, redirectURL string, template base.TplName) {
+func performRuleEditPost(ctx *context.Context, owner *user_model.User, pcr *packages_model.PackageCleanupRule, redirectURL string, template templates.TplName) {
 	isEditRule := pcr != nil
 
 	if pcr == nil {
 		pcr = &packages_model.PackageCleanupRule{}
 	}
 
-	form := web.GetForm(ctx).(*forms.PackageCleanupRuleForm)
+	form := web.GetForm[*forms.PackageCleanupRuleForm](ctx)
 
 	pcr.Enabled = form.Enabled
 	pcr.OwnerID = owner.ID
@@ -107,24 +106,25 @@ func performRuleEditPost(ctx *context.Context, owner *user_model.User, pcr *pack
 
 	if isEditRule {
 		if err := packages_model.UpdateCleanupRule(ctx, pcr); err != nil {
-			ctx.ServerError("UpdateCleanupRule", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 	} else {
 		pcr.Type = packages_model.Type(form.Type)
 
 		if has, err := packages_model.HasOwnerCleanupRuleForPackageType(ctx, owner.ID, pcr.Type); err != nil {
-			ctx.ServerError("HasOwnerCleanupRuleForPackageType", err)
+			ctx.ServerErrorAuto(err)
 			return
 		} else if has {
 			ctx.Data["Err_Type"] = true
+			ctx.Flash.Error(ctx.Tr("packages.owner.settings.cleanuprules.type.already_exists"), true)
 			ctx.HTML(http.StatusOK, template)
 			return
 		}
 
 		var err error
 		if pcr, err = packages_model.InsertCleanupRule(ctx, pcr); err != nil {
-			ctx.ServerError("InsertCleanupRule", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 	}
@@ -140,7 +140,7 @@ func SetRulePreviewContext(ctx *context.Context, owner *user_model.User) {
 	}
 
 	if err := pcr.CompiledPattern(); err != nil {
-		ctx.ServerError("CompiledPattern", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
@@ -148,7 +148,7 @@ func SetRulePreviewContext(ctx *context.Context, owner *user_model.User) {
 
 	packages, err := packages_model.GetPackagesByType(ctx, pcr.OwnerID, pcr.Type)
 	if err != nil {
-		ctx.ServerError("GetPackagesByType", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
@@ -157,17 +157,23 @@ func SetRulePreviewContext(ctx *context.Context, owner *user_model.User) {
 	for _, p := range packages {
 		pvs, _, err := packages_model.SearchVersions(ctx, &packages_model.PackageSearchOptions{
 			PackageID:  p.ID,
-			IsInternal: util.OptionalBoolFalse,
+			IsInternal: optional.Some(false),
 			Sort:       packages_model.SortCreatedDesc,
-			Paginator:  db.NewAbsoluteListOptions(pcr.KeepCount, 200),
 		})
 		if err != nil {
-			ctx.ServerError("SearchVersions", err)
+			ctx.ServerErrorAuto(err)
 			return
+		}
+		if pcr.KeepCount > 0 {
+			if pcr.KeepCount < len(pvs) {
+				pvs = pvs[pcr.KeepCount:]
+			} else {
+				pvs = nil
+			}
 		}
 		for _, pv := range pvs {
 			if skip, err := container_service.ShouldBeSkipped(ctx, pcr, p, pv); err != nil {
-				ctx.ServerError("ShouldBeSkipped", err)
+				ctx.ServerErrorAuto(err)
 				return
 			} else if skip {
 				continue
@@ -177,7 +183,6 @@ func SetRulePreviewContext(ctx *context.Context, owner *user_model.User) {
 			if pcr.MatchFullName {
 				toMatch = p.LowerName + "/" + pv.LowerVersion
 			}
-
 			if pcr.KeepPatternMatcher != nil && pcr.KeepPatternMatcher.MatchString(toMatch) {
 				continue
 			}
@@ -190,7 +195,7 @@ func SetRulePreviewContext(ctx *context.Context, owner *user_model.User) {
 
 			pd, err := packages_model.GetPackageDescriptor(ctx, pv)
 			if err != nil {
-				ctx.ServerError("GetPackageDescriptor", err)
+				ctx.ServerErrorAuto(err)
 				return
 			}
 			versionsToRemove = append(versionsToRemove, pd)
@@ -204,16 +209,12 @@ func SetRulePreviewContext(ctx *context.Context, owner *user_model.User) {
 func getCleanupRuleByContext(ctx *context.Context, owner *user_model.User) *packages_model.PackageCleanupRule {
 	id := ctx.FormInt64("id")
 	if id == 0 {
-		id = ctx.ParamsInt64("id")
+		id = ctx.PathParamInt64("id")
 	}
 
 	pcr, err := packages_model.GetCleanupRuleByID(ctx, id)
 	if err != nil {
-		if err == packages_model.ErrPackageCleanupRuleNotExist {
-			ctx.NotFound("", err)
-		} else {
-			ctx.ServerError("GetCleanupRuleByID", err)
-		}
+		ctx.ServerErrorAuto(err)
 		return nil
 	}
 
@@ -221,7 +222,7 @@ func getCleanupRuleByContext(ctx *context.Context, owner *user_model.User) *pack
 		return pcr
 	}
 
-	ctx.NotFound("", fmt.Errorf("PackageCleanupRule[%v] not associated to owner %v", id, owner))
+	ctx.NotFound()
 
 	return nil
 }

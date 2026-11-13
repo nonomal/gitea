@@ -4,9 +4,9 @@
 package integration
 
 import (
-	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,50 +14,45 @@ import (
 	"strings"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	base "code.gitea.io/gitea/modules/migration"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/services/migrations"
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	base "gitea.dev/modules/migration"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/test"
+	"gitea.dev/services/migrations"
 
 	"github.com/stretchr/testify/assert"
-	"gopkg.in/yaml.v3"
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v4"
 )
 
 func TestDumpRestore(t *testing.T) {
 	onGiteaRun(t, func(t *testing.T, u *url.URL) {
-		AllowLocalNetworks := setting.Migrations.AllowLocalNetworks
-		setting.Migrations.AllowLocalNetworks = true
-		AppVer := setting.AppVer
 		// Gitea SDK (go-sdk) need to parse the AppVer from server response, so we must set it to a valid version string.
-		setting.AppVer = "1.16.0"
-		defer func() {
-			setting.Migrations.AllowLocalNetworks = AllowLocalNetworks
-			setting.AppVer = AppVer
-		}()
-
-		assert.NoError(t, migrations.Init())
+		defer test.MockVariableValue(&setting.AppVer, "1.16.0")()
 
 		reponame := "repo1"
 
-		basePath, err := os.MkdirTemp("", reponame)
-		assert.NoError(t, err)
-		defer util.RemoveAll(basePath)
-
+		basePath := t.TempDir()
 		repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{Name: reponame})
 		repoOwner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
 		session := loginUser(t, repoOwner.Name)
-		token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeRepo)
+		token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteIssue, auth_model.AccessTokenScopeWriteRepository, auth_model.AccessTokenScopeReadMisc)
 
 		//
 		// Phase 1: dump repo1 from the Gitea instance to the filesystem
 		//
 
-		ctx := context.Background()
+		ctx := t.Context()
+		for bean, id := range map[any]int64{&issues_model.Issue{}: 1, &issues_model.Comment{}: 2, &issues_model.Reaction{}: 3, &issues_model.Reaction{}: 4} {
+			_, err := db.GetEngine(ctx).Table(bean).ID(id).Update(map[string]any{"original_author": "octocat", "original_author_id": 583231})
+			require.NoError(t, err)
+		}
 		opts := migrations.MigrateOptions{
 			GitServiceType: structs.GiteaService,
 			Issues:         true,
@@ -66,10 +61,10 @@ func TestDumpRestore(t *testing.T) {
 			Milestones:     true,
 			Comments:       true,
 			AuthToken:      token,
-			CloneAddr:      repo.CloneLink().HTTPS,
+			CloneAddr:      repo.CloneLinkGeneral(t.Context()).HTTPS,
 			RepoName:       reponame,
 		}
-		err = migrations.DumpRepository(ctx, basePath, repoOwner.Name, opts)
+		err := migrations.DumpRepository(ctx, basePath, repoOwner.Name, opts)
 		assert.NoError(t, err)
 
 		//
@@ -78,6 +73,14 @@ func TestDumpRestore(t *testing.T) {
 		d := filepath.Join(basePath, repo.OwnerName, repo.Name)
 		for _, f := range []string{"repo.yml", "topic.yml", "label.yml", "milestone.yml", "issue.yml"} {
 			assert.FileExists(t, filepath.Join(d, f))
+		}
+		var issues []*base.Issue
+		var comments []*base.Comment
+		require.NoError(t, base.Load(filepath.Join(d, "issue.yml"), &issues, false))
+		require.NoError(t, base.Load(filepath.Join(d, "comments/1.yml"), &comments, false))
+		for _, author := range []user_model.ExternalUserMigrated{issues[1], issues[1].Reactions[0], comments[0], comments[0].Reactions[0]} {
+			assert.Equal(t, user_model.GhostUserID, author.GetExternalID())
+			assert.Equal(t, "octocat", author.GetExternalName())
 		}
 
 		//
@@ -96,7 +99,7 @@ func TestDumpRestore(t *testing.T) {
 		// Phase 3: dump restored from the Gitea instance to the filesystem
 		//
 		opts.RepoName = newreponame
-		opts.CloneAddr = newrepo.CloneLink().HTTPS
+		opts.CloneAddr = newrepo.CloneLinkGeneral(t.Context()).HTTPS
 		err = migrations.DumpRepository(ctx, basePath, repoOwner.Name, opts)
 		assert.NoError(t, err)
 
@@ -121,8 +124,8 @@ type compareDump struct {
 }
 
 type compareField struct {
-	before    interface{}
-	after     interface{}
+	before    any
+	after     any
 	ignore    bool
 	transform func(string) string
 	nested    *compareFields
@@ -183,7 +186,7 @@ func (c *compareDump) assertEquals(repoBefore, repoAfter *repo_model.Repository)
 		}).([]*base.Comment)
 		assert.True(c.t, ok)
 		for _, comment := range comments {
-			assert.EqualValues(c.t, issue.Number, comment.IssueIndex)
+			assert.Equal(c.t, issue.Number, comment.IssueIndex)
 		}
 	}
 
@@ -197,10 +200,12 @@ func (c *compareDump) assertEquals(repoBefore, repoAfter *repo_model.Repository)
 		},
 		"CloneURL": {transform: c.replaceRepoName},
 	}
+	compareBaseBranch := maps.Clone(*comparePullRequestBranch)
+	compareBaseBranch["SHA"] = compareField{ignore: true}
 	prs, ok := c.assertEqual("pull_request.yml", []base.PullRequest{}, compareFields{
 		"Assignees": {ignore: true}, // not implemented yet
 		"Head":      {nested: comparePullRequestBranch},
-		"Base":      {nested: comparePullRequestBranch},
+		"Base":      {nested: &compareBaseBranch},
 		"Labels":    {ignore: true}, // because org labels are not handled properly
 	}).([]*base.PullRequest)
 	assert.True(c.t, ok)
@@ -210,15 +215,15 @@ func (c *compareDump) assertEquals(repoBefore, repoAfter *repo_model.Repository)
 		comments, ok := c.assertEqual(filename, []base.Comment{}, compareFields{}).([]*base.Comment)
 		assert.True(c.t, ok)
 		for _, comment := range comments {
-			assert.EqualValues(c.t, pr.Number, comment.IssueIndex)
+			assert.Equal(c.t, pr.Number, comment.IssueIndex)
 		}
 	}
 }
 
-func (c *compareDump) assertLoadYAMLFiles(beforeFilename, afterFilename string, before, after interface{}) {
+func (c *compareDump) assertLoadYAMLFiles(beforeFilename, afterFilename string, before, after any) {
 	_, beforeErr := os.Stat(beforeFilename)
 	_, afterErr := os.Stat(afterFilename)
-	assert.EqualValues(c.t, errors.Is(beforeErr, os.ErrNotExist), errors.Is(afterErr, os.ErrNotExist))
+	assert.Equal(c.t, errors.Is(beforeErr, os.ErrNotExist), errors.Is(afterErr, os.ErrNotExist))
 	if errors.Is(beforeErr, os.ErrNotExist) {
 		return
 	}
@@ -237,7 +242,7 @@ func (c *compareDump) assertLoadFiles(beforeFilename, afterFilename string, t re
 		//
 		// Given []Something{} create afterPtr, beforePtr []*Something{}
 		//
-		sliceType := reflect.SliceOf(reflect.PtrTo(t.Elem()))
+		sliceType := reflect.SliceOf(reflect.PointerTo(t.Elem()))
 		beforeSlice := reflect.MakeSlice(sliceType, 0, 10)
 		beforePtr = reflect.New(beforeSlice.Type())
 		beforePtr.Elem().Set(beforeSlice)
@@ -255,7 +260,7 @@ func (c *compareDump) assertLoadFiles(beforeFilename, afterFilename string, t re
 	return beforePtr.Elem(), afterPtr.Elem()
 }
 
-func (c *compareDump) assertEqual(filename string, kind interface{}, fields compareFields) (i interface{}) {
+func (c *compareDump) assertEqual(filename string, kind any, fields compareFields) (i any) {
 	beforeFilename := filepath.Join(c.dirBefore, filename)
 	afterFilename := filepath.Join(c.dirAfter, filename)
 
@@ -269,8 +274,8 @@ func (c *compareDump) assertEqual(filename string, kind interface{}, fields comp
 	return i
 }
 
-func (c *compareDump) assertEqualSlices(before, after reflect.Value, fields compareFields) interface{} {
-	assert.EqualValues(c.t, before.Len(), after.Len())
+func (c *compareDump) assertEqualSlices(before, after reflect.Value, fields compareFields) any {
+	assert.Equal(c.t, before.Len(), after.Len())
 	if before.Len() == after.Len() {
 		for i := 0; i < before.Len(); i++ {
 			_ = c.assertEqualValues(
@@ -282,7 +287,7 @@ func (c *compareDump) assertEqualSlices(before, after reflect.Value, fields comp
 	return after.Interface()
 }
 
-func (c *compareDump) assertEqualValues(before, after reflect.Value, fields compareFields) interface{} {
+func (c *compareDump) assertEqualValues(before, after reflect.Value, fields compareFields) any {
 	for _, field := range reflect.VisibleFields(before.Type()) {
 		bf := before.FieldByName(field.Name)
 		bi := bf.Interface()
@@ -303,15 +308,15 @@ func (c *compareDump) assertEqualValues(before, after reflect.Value, fields comp
 				assert.True(c.t, ok)
 				as, ok := ai.(string)
 				assert.True(c.t, ok)
-				assert.EqualValues(c.t, compare.transform(bs), compare.transform(as))
+				assert.Equal(c.t, compare.transform(bs), compare.transform(as))
 				continue
 			}
 			if compare.before != nil && compare.after != nil {
 				//
 				// The fields are expected to have different values
 				//
-				assert.EqualValues(c.t, compare.before, bi)
-				assert.EqualValues(c.t, compare.after, ai)
+				assert.Equal(c.t, compare.before, bi)
+				assert.Equal(c.t, compare.after, ai)
 				continue
 			}
 			if compare.nested != nil {
@@ -322,7 +327,7 @@ func (c *compareDump) assertEqualValues(before, after reflect.Value, fields comp
 				continue
 			}
 		}
-		assert.EqualValues(c.t, bi, ai)
+		assert.Equal(c.t, bi, ai)
 	}
 	return after.Interface()
 }

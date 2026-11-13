@@ -4,14 +4,15 @@
 package asymkey
 
 import (
-	"path/filepath"
 	"testing"
 
-	"code.gitea.io/gitea/models/unittest"
+	"gitea.dev/models/unittest"
+
+	_ "gitea.dev/models"
+	_ "gitea.dev/models/actions"
+	_ "gitea.dev/models/activities"
 )
 
 func TestMain(m *testing.M) {
-	unittest.MainTest(m, &unittest.TestOptions{
-		GiteaRootPath: filepath.Join("..", ".."),
-	})
+	unittest.MainTest(m)
 }

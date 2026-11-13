@@ -4,15 +4,16 @@
 package healthcheck
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/cache"
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/cache"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
 )
 
 type status string
@@ -63,6 +64,15 @@ type componentStatus struct {
 }
 
 // Check is the health check API handler
+//
+// HINT: HEALTH-CHECK-ENDPOINT: there is no clear definition about what "health" means.
+// In most cases, end users don't need to check such endpoint, because even if database is down,
+// Gitea will reover after database is up again. Sysop should monitor database and cache status directly.
+//
+// And keep in mind: this health check should NEVER be used as a "restart" trigger, for example: Docker's "HEALTHCHECK".
+// * If Gitea is upgrading and migrating database, there will be a long time before this endpoint starts to return "pass" status.
+// In this case, if the checker restarts Gitea just because it doesn't get "pass" status in short time,
+// the instance will just be restarted again and again before the migration finishes and the situation just goes worse.
 func Check(w http.ResponseWriter, r *http.Request) {
 	rsp := response{
 		Status:      pass,
@@ -72,7 +82,7 @@ func Check(w http.ResponseWriter, r *http.Request) {
 
 	statuses := make([]status, 0)
 	if setting.InstallLock {
-		statuses = append(statuses, checkDatabase(rsp.Checks))
+		statuses = append(statuses, checkDatabase(r.Context(), rsp.Checks))
 		statuses = append(statuses, checkCache(rsp.Checks))
 	}
 	for _, s := range statuses {
@@ -89,9 +99,9 @@ func Check(w http.ResponseWriter, r *http.Request) {
 }
 
 // database checks gitea database status
-func checkDatabase(checks checks) status {
+func checkDatabase(ctx context.Context, checks checks) status {
 	st := componentStatus{}
-	if err := db.GetEngine(db.DefaultContext).Ping(); err != nil {
+	if err := db.GetEngine(ctx).Ping(); err != nil {
 		st.Status = fail
 		st.Time = getCheckTime()
 		log.Error("database ping failed with error: %v", err)
@@ -101,16 +111,10 @@ func checkDatabase(checks checks) status {
 	}
 
 	if setting.Database.Type.IsSQLite3() && st.Status == pass {
-		if !setting.EnableSQLite3 {
+		if _, err := os.Stat(setting.Database.Path); err != nil {
 			st.Status = fail
 			st.Time = getCheckTime()
-			log.Error("SQLite3 health check failed with error: %v", "this Gitea binary is built without SQLite3 enabled")
-		} else {
-			if _, err := os.Stat(setting.Database.Path); err != nil {
-				st.Status = fail
-				st.Time = getCheckTime()
-				log.Error("SQLite3 file exists check failed with error: %v", err)
-			}
+			log.Error("SQLite3 file exists check failed with error: %v", err)
 		}
 	}
 
@@ -120,10 +124,6 @@ func checkDatabase(checks checks) status {
 
 // cache checks gitea cache status
 func checkCache(checks checks) status {
-	if !setting.CacheService.Enabled {
-		return pass
-	}
-
 	st := componentStatus{}
 	if err := cache.GetCache().Ping(); err != nil {
 		st.Status = fail

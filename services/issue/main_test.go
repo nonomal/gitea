@@ -4,14 +4,18 @@
 package issue
 
 import (
-	"path/filepath"
 	"testing"
 
-	"code.gitea.io/gitea/models/unittest"
+	"gitea.dev/models/unittest"
+	notify_service "gitea.dev/services/notify"
+
+	_ "gitea.dev/models"
+	_ "gitea.dev/models/actions"
 )
 
+var labelChanges = &labelChangeRecorder{}
+
 func TestMain(m *testing.M) {
-	unittest.MainTest(m, &unittest.TestOptions{
-		GiteaRootPath: filepath.Join("..", ".."),
-	})
+	notify_service.RegisterNotifier(labelChanges)
+	unittest.MainTest(m)
 }

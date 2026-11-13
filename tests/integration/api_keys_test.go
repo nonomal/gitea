@@ -9,94 +9,93 @@ import (
 	"net/url"
 	"testing"
 
-	asymkey_model "code.gitea.io/gitea/models/asymkey"
-	auth_model "code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/perm"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/tests"
+	asymkey_model "gitea.dev/models/asymkey"
+	auth_model "gitea.dev/models/auth"
+	deploykey_model "gitea.dev/models/deploykey"
+	"gitea.dev/models/perm"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestViewDeployKeysNoLogin(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
-	req := NewRequest(t, "GET", "/api/v1/repos/user2/repo1/keys")
-	MakeRequest(t, req, http.StatusUnauthorized)
-}
 
-func TestCreateDeployKeyNoLogin(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
-	req := NewRequestWithJSON(t, "POST", "/api/v1/repos/user2/repo1/keys", api.CreateKeyOption{
-		Title: "title",
-		Key:   "key",
+	t.Run("view", func(t *testing.T) {
+		req := NewRequest(t, "GET", "/api/v1/repos/user2/repo1/keys")
+		MakeRequest(t, req, http.StatusUnauthorized)
 	})
-	MakeRequest(t, req, http.StatusUnauthorized)
+
+	t.Run("create", func(t *testing.T) {
+		req := NewRequestWithJSON(t, "POST", "/api/v1/repos/user2/repo1/keys", api.CreateKeyOption{
+			Title: "title",
+			Key:   "key",
+		})
+		MakeRequest(t, req, http.StatusUnauthorized)
+	})
+
+	t.Run("get", func(t *testing.T) {
+		req := NewRequest(t, "GET", "/api/v1/repos/user2/repo1/keys/1")
+		MakeRequest(t, req, http.StatusUnauthorized)
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		req := NewRequest(t, "DELETE", "/api/v1/repos/user2/repo1/keys/1")
+		MakeRequest(t, req, http.StatusUnauthorized)
+	})
 }
 
-func TestGetDeployKeyNoLogin(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
-	req := NewRequest(t, "GET", "/api/v1/repos/user2/repo1/keys/1")
-	MakeRequest(t, req, http.StatusUnauthorized)
-}
+func TestCreateDeployKey(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		readOnly bool
+		mode     perm.AccessMode
+	}{
+		{"read-only", true, perm.AccessModeRead},
+		{"read-write", false, perm.AccessModeWrite},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			defer tests.PrepareTestEnv(t)()
+			repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{Name: "repo1"})
+			repoOwner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
 
-func TestDeleteDeployKeyNoLogin(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
-	req := NewRequest(t, "DELETE", "/api/v1/repos/user2/repo1/keys/1")
-	MakeRequest(t, req, http.StatusUnauthorized)
-}
+			session := loginUser(t, repoOwner.Name)
+			token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+			keysURL := fmt.Sprintf("/api/v1/repos/%s/%s/keys", repoOwner.Name, repo.Name)
+			rawKeyBody := api.CreateKeyOption{
+				Title:    testCase.name,
+				Key:      "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC4cn+iXnA4KvcQYSV88vGn0Yi91vG47t1P7okprVmhNTkipNRIHWr6WdCO4VDr/cvsRkuVJAsLO2enwjGWWueOO6BodiBgyAOZ/5t5nJNMCNuLGT5UIo/RI1b0WRQwxEZTRjt6mFNw6lH14wRd8ulsr9toSWBPMOGWoYs1PDeDL0JuTjL+tr1SZi/EyxCngpYszKdXllJEHyI79KQgeD0Vt3pTrkbNVTOEcCNqZePSVmUH8X8Vhugz3bnE0/iE9Pb5fkWO9c4AnM1FgI/8Bvp27Fw2ShryIXuR6kKvUqhVMTuOSDHwu6A8jLE5Owt3GAYugDpDYuwTVNGrHLXKpPzrGGPE/jPmaLCMZcsdkec95dYeU3zKODEm8UQZFhmJmDeWVJ36nGrGZHL4J5aTTaeFUJmmXDaJYiJ+K2/ioKgXqnXvltu0A9R8/LGy4nrTJRr4JMLuJFoUXvGm1gXQ70w2LSpk6yl71RNC0hCtsBe8BP8IhYCM0EP5jh7eCMQZNvM= nocomment\n",
+				ReadOnly: testCase.readOnly,
+			}
+			req := NewRequestWithJSON(t, "POST", keysURL, rawKeyBody).
+				AddTokenAuth(token)
+			resp := MakeRequest(t, req, http.StatusCreated)
 
-func TestCreateReadOnlyDeployKey(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
-	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{Name: "repo1"})
-	repoOwner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+			newDeployKey := DecodeJSON(t, resp, &api.DeployKey{})
+			unittest.AssertExistsAndLoadBean(t, &deploykey_model.DeployKey{
+				ID:   newDeployKey.ID,
+				Name: rawKeyBody.Title,
+				Mode: testCase.mode,
+			})
 
-	session := loginUser(t, repoOwner.Name)
-	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeRepo)
-	keysURL := fmt.Sprintf("/api/v1/repos/%s/%s/keys?token=%s", repoOwner.Name, repo.Name, token)
-	rawKeyBody := api.CreateKeyOption{
-		Title:    "read-only",
-		Key:      "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC4cn+iXnA4KvcQYSV88vGn0Yi91vG47t1P7okprVmhNTkipNRIHWr6WdCO4VDr/cvsRkuVJAsLO2enwjGWWueOO6BodiBgyAOZ/5t5nJNMCNuLGT5UIo/RI1b0WRQwxEZTRjt6mFNw6lH14wRd8ulsr9toSWBPMOGWoYs1PDeDL0JuTjL+tr1SZi/EyxCngpYszKdXllJEHyI79KQgeD0Vt3pTrkbNVTOEcCNqZePSVmUH8X8Vhugz3bnE0/iE9Pb5fkWO9c4AnM1FgI/8Bvp27Fw2ShryIXuR6kKvUqhVMTuOSDHwu6A8jLE5Owt3GAYugDpDYuwTVNGrHLXKpPzrGGPE/jPmaLCMZcsdkec95dYeU3zKODEm8UQZFhmJmDeWVJ36nGrGZHL4J5aTTaeFUJmmXDaJYiJ+K2/ioKgXqnXvltu0A9R8/LGy4nrTJRr4JMLuJFoUXvGm1gXQ70w2LSpk6yl71RNC0hCtsBe8BP8IhYCM0EP5jh7eCMQZNvM= nocomment\n",
-		ReadOnly: true,
+			// Using the ID of a key that does not belong to the repository must fail
+			if testCase.readOnly {
+				req := NewRequest(t, "GET", fmt.Sprintf("/api/v1/repos/%s/%s/keys/%d", repoOwner.Name, repo.Name, newDeployKey.ID)).
+					AddTokenAuth(token)
+				MakeRequest(t, req, http.StatusOK)
+
+				session5 := loginUser(t, "user5")
+				token5 := getTokenForLoggedInUser(t, session5, auth_model.AccessTokenScopeWriteRepository)
+				req = NewRequest(t, "GET", fmt.Sprintf("/api/v1/repos/user5/repo4/keys/%d", newDeployKey.ID)).
+					AddTokenAuth(token5)
+				MakeRequest(t, req, http.StatusNotFound)
+			}
+		})
 	}
-	req := NewRequestWithJSON(t, "POST", keysURL, rawKeyBody)
-	resp := MakeRequest(t, req, http.StatusCreated)
-
-	var newDeployKey api.DeployKey
-	DecodeJSON(t, resp, &newDeployKey)
-	unittest.AssertExistsAndLoadBean(t, &asymkey_model.DeployKey{
-		ID:      newDeployKey.ID,
-		Name:    rawKeyBody.Title,
-		Content: rawKeyBody.Key,
-		Mode:    perm.AccessModeRead,
-	})
-}
-
-func TestCreateReadWriteDeployKey(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
-	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{Name: "repo1"})
-	repoOwner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
-
-	session := loginUser(t, repoOwner.Name)
-	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeRepo)
-	keysURL := fmt.Sprintf("/api/v1/repos/%s/%s/keys?token=%s", repoOwner.Name, repo.Name, token)
-	rawKeyBody := api.CreateKeyOption{
-		Title: "read-write",
-		Key:   "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC4cn+iXnA4KvcQYSV88vGn0Yi91vG47t1P7okprVmhNTkipNRIHWr6WdCO4VDr/cvsRkuVJAsLO2enwjGWWueOO6BodiBgyAOZ/5t5nJNMCNuLGT5UIo/RI1b0WRQwxEZTRjt6mFNw6lH14wRd8ulsr9toSWBPMOGWoYs1PDeDL0JuTjL+tr1SZi/EyxCngpYszKdXllJEHyI79KQgeD0Vt3pTrkbNVTOEcCNqZePSVmUH8X8Vhugz3bnE0/iE9Pb5fkWO9c4AnM1FgI/8Bvp27Fw2ShryIXuR6kKvUqhVMTuOSDHwu6A8jLE5Owt3GAYugDpDYuwTVNGrHLXKpPzrGGPE/jPmaLCMZcsdkec95dYeU3zKODEm8UQZFhmJmDeWVJ36nGrGZHL4J5aTTaeFUJmmXDaJYiJ+K2/ioKgXqnXvltu0A9R8/LGy4nrTJRr4JMLuJFoUXvGm1gXQ70w2LSpk6yl71RNC0hCtsBe8BP8IhYCM0EP5jh7eCMQZNvM= nocomment\n",
-	}
-	req := NewRequestWithJSON(t, "POST", keysURL, rawKeyBody)
-	resp := MakeRequest(t, req, http.StatusCreated)
-
-	var newDeployKey api.DeployKey
-	DecodeJSON(t, resp, &newDeployKey)
-	unittest.AssertExistsAndLoadBean(t, &asymkey_model.DeployKey{
-		ID:      newDeployKey.ID,
-		Name:    rawKeyBody.Title,
-		Content: rawKeyBody.Key,
-		Mode:    perm.AccessModeWrite,
-	})
 }
 
 func TestCreateUserKey(t *testing.T) {
@@ -104,19 +103,18 @@ func TestCreateUserKey(t *testing.T) {
 	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{Name: "user1"})
 
 	session := loginUser(t, "user1")
-	token := url.QueryEscape(getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeAdminPublicKey))
-	keysURL := fmt.Sprintf("/api/v1/user/keys?token=%s", token)
+	token := url.QueryEscape(getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteUser))
 	keyType := "ssh-rsa"
 	keyContent := "AAAAB3NzaC1yc2EAAAADAQABAAABgQC4cn+iXnA4KvcQYSV88vGn0Yi91vG47t1P7okprVmhNTkipNRIHWr6WdCO4VDr/cvsRkuVJAsLO2enwjGWWueOO6BodiBgyAOZ/5t5nJNMCNuLGT5UIo/RI1b0WRQwxEZTRjt6mFNw6lH14wRd8ulsr9toSWBPMOGWoYs1PDeDL0JuTjL+tr1SZi/EyxCngpYszKdXllJEHyI79KQgeD0Vt3pTrkbNVTOEcCNqZePSVmUH8X8Vhugz3bnE0/iE9Pb5fkWO9c4AnM1FgI/8Bvp27Fw2ShryIXuR6kKvUqhVMTuOSDHwu6A8jLE5Owt3GAYugDpDYuwTVNGrHLXKpPzrGGPE/jPmaLCMZcsdkec95dYeU3zKODEm8UQZFhmJmDeWVJ36nGrGZHL4J5aTTaeFUJmmXDaJYiJ+K2/ioKgXqnXvltu0A9R8/LGy4nrTJRr4JMLuJFoUXvGm1gXQ70w2LSpk6yl71RNC0hCtsBe8BP8IhYCM0EP5jh7eCMQZNvM="
 	rawKeyBody := api.CreateKeyOption{
 		Title: "test-key",
 		Key:   keyType + " " + keyContent,
 	}
-	req := NewRequestWithJSON(t, "POST", keysURL, rawKeyBody)
+	req := NewRequestWithJSON(t, "POST", "/api/v1/user/keys", rawKeyBody).
+		AddTokenAuth(token)
 	resp := MakeRequest(t, req, http.StatusCreated)
 
-	var newPublicKey api.PublicKey
-	DecodeJSON(t, resp, &newPublicKey)
+	newPublicKey := DecodeJSON(t, resp, &api.PublicKey{})
 	fingerprint, err := asymkey_model.CalcFingerprint(rawKeyBody.Key)
 	assert.NoError(t, err)
 	unittest.AssertExistsAndLoadBean(t, &asymkey_model.PublicKey{
@@ -128,74 +126,86 @@ func TestCreateUserKey(t *testing.T) {
 	})
 
 	// Search by fingerprint
-	fingerprintURL := fmt.Sprintf("/api/v1/user/keys?token=%s&fingerprint=%s", token, newPublicKey.Fingerprint)
+	for _, url := range []string{
+		"/api/v1/user/keys?fingerprint=" + newPublicKey.Fingerprint,
+		fmt.Sprintf("/api/v1/users/%s/keys?fingerprint=%s", user.Name, newPublicKey.Fingerprint),
+	} {
+		req = NewRequest(t, "GET", url).AddTokenAuth(token)
+		resp = MakeRequest(t, req, http.StatusOK)
 
-	req = NewRequest(t, "GET", fingerprintURL)
-	resp = MakeRequest(t, req, http.StatusOK)
-
-	var fingerprintPublicKeys []api.PublicKey
-	DecodeJSON(t, resp, &fingerprintPublicKeys)
-	assert.Equal(t, newPublicKey.Fingerprint, fingerprintPublicKeys[0].Fingerprint)
-	assert.Equal(t, newPublicKey.ID, fingerprintPublicKeys[0].ID)
-	assert.Equal(t, user.ID, fingerprintPublicKeys[0].Owner.ID)
-
-	fingerprintURL = fmt.Sprintf("/api/v1/users/%s/keys?token=%s&fingerprint=%s", user.Name, token, newPublicKey.Fingerprint)
-
-	req = NewRequest(t, "GET", fingerprintURL)
-	resp = MakeRequest(t, req, http.StatusOK)
-
-	DecodeJSON(t, resp, &fingerprintPublicKeys)
-	assert.Equal(t, newPublicKey.Fingerprint, fingerprintPublicKeys[0].Fingerprint)
-	assert.Equal(t, newPublicKey.ID, fingerprintPublicKeys[0].ID)
-	assert.Equal(t, user.ID, fingerprintPublicKeys[0].Owner.ID)
+		fingerprintPublicKeys := DecodeJSON(t, resp, []api.PublicKey{})
+		assert.Equal(t, newPublicKey.Fingerprint, fingerprintPublicKeys[0].Fingerprint)
+		assert.Equal(t, newPublicKey.ID, fingerprintPublicKeys[0].ID)
+		assert.Equal(t, user.ID, fingerprintPublicKeys[0].Owner.ID)
+	}
 
 	// Fail search by fingerprint
-	fingerprintURL = fmt.Sprintf("/api/v1/user/keys?token=%s&fingerprint=%sA", token, newPublicKey.Fingerprint)
-
-	req = NewRequest(t, "GET", fingerprintURL)
+	req = NewRequest(t, "GET", fmt.Sprintf("/api/v1/user/keys?fingerprint=%sA", newPublicKey.Fingerprint)).
+		AddTokenAuth(token)
 	resp = MakeRequest(t, req, http.StatusOK)
 
-	DecodeJSON(t, resp, &fingerprintPublicKeys)
-	assert.Len(t, fingerprintPublicKeys, 0)
+	fingerprintPublicKeys := DecodeJSON(t, resp, []api.PublicKey{})
+	assert.Empty(t, fingerprintPublicKeys)
 
 	// Fail searching for wrong users key
-	fingerprintURL = fmt.Sprintf("/api/v1/users/%s/keys?token=%s&fingerprint=%s", "user2", token, newPublicKey.Fingerprint)
-	req = NewRequest(t, "GET", fingerprintURL)
+	req = NewRequest(t, "GET", fmt.Sprintf("/api/v1/users/%s/keys?fingerprint=%s", "user2", newPublicKey.Fingerprint)).
+		AddTokenAuth(token)
 	resp = MakeRequest(t, req, http.StatusOK)
 
-	DecodeJSON(t, resp, &fingerprintPublicKeys)
-	assert.Len(t, fingerprintPublicKeys, 0)
+	fingerprintPublicKeys = DecodeJSON(t, resp, []api.PublicKey{})
+	assert.Empty(t, fingerprintPublicKeys)
 
 	// Now login as user 2
 	session2 := loginUser(t, "user2")
-	token2 := url.QueryEscape(getTokenForLoggedInUser(t, session2, auth_model.AccessTokenScopeAdminPublicKey))
+	token2 := getTokenForLoggedInUser(t, session2, auth_model.AccessTokenScopeWriteUser)
 
 	// Should find key even though not ours, but we shouldn't know whose it is
-	fingerprintURL = fmt.Sprintf("/api/v1/user/keys?token=%s&fingerprint=%s", token2, newPublicKey.Fingerprint)
-	req = NewRequest(t, "GET", fingerprintURL)
-	resp = MakeRequest(t, req, http.StatusOK)
+	for _, url := range []string{
+		"/api/v1/user/keys?fingerprint=" + newPublicKey.Fingerprint,
+		fmt.Sprintf("/api/v1/users/%s/keys?fingerprint=%s", user.Name, newPublicKey.Fingerprint),
+	} {
+		req = NewRequest(t, "GET", url).AddTokenAuth(token2)
+		resp = MakeRequest(t, req, http.StatusOK)
 
-	DecodeJSON(t, resp, &fingerprintPublicKeys)
-	assert.Equal(t, newPublicKey.Fingerprint, fingerprintPublicKeys[0].Fingerprint)
-	assert.Equal(t, newPublicKey.ID, fingerprintPublicKeys[0].ID)
-	assert.Nil(t, fingerprintPublicKeys[0].Owner)
-
-	// Should find key even though not ours, but we shouldn't know whose it is
-	fingerprintURL = fmt.Sprintf("/api/v1/users/%s/keys?token=%s&fingerprint=%s", user.Name, token2, newPublicKey.Fingerprint)
-
-	req = NewRequest(t, "GET", fingerprintURL)
-	resp = MakeRequest(t, req, http.StatusOK)
-
-	DecodeJSON(t, resp, &fingerprintPublicKeys)
-	assert.Equal(t, newPublicKey.Fingerprint, fingerprintPublicKeys[0].Fingerprint)
-	assert.Equal(t, newPublicKey.ID, fingerprintPublicKeys[0].ID)
-	assert.Nil(t, fingerprintPublicKeys[0].Owner)
+		fingerprintPublicKeys := DecodeJSON(t, resp, []api.PublicKey{})
+		assert.Equal(t, newPublicKey.Fingerprint, fingerprintPublicKeys[0].Fingerprint)
+		assert.Equal(t, newPublicKey.ID, fingerprintPublicKeys[0].ID)
+		assert.Nil(t, fingerprintPublicKeys[0].Owner)
+	}
 
 	// Fail when searching for key if it is not ours
-	fingerprintURL = fmt.Sprintf("/api/v1/users/%s/keys?token=%s&fingerprint=%s", "user2", token2, newPublicKey.Fingerprint)
-	req = NewRequest(t, "GET", fingerprintURL)
+	req = NewRequest(t, "GET", fmt.Sprintf("/api/v1/users/%s/keys?fingerprint=%s", "user2", newPublicKey.Fingerprint)).
+		AddTokenAuth(token2)
 	resp = MakeRequest(t, req, http.StatusOK)
 
-	DecodeJSON(t, resp, &fingerprintPublicKeys)
-	assert.Len(t, fingerprintPublicKeys, 0)
+	fingerprintPublicKeys = DecodeJSON(t, resp, []api.PublicKey{})
+	assert.Empty(t, fingerprintPublicKeys)
+}
+
+func TestCreateDeployToken(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{Name: "repo1"})
+	repoOwner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+
+	session := loginUser(t, repoOwner.Name)
+	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+	keysURL := fmt.Sprintf("/api/v1/repos/%s/%s/keys", repoOwner.Name, repo.Name)
+
+	req := NewRequestWithJSON(t, "POST", keysURL+"/tokens", api.CreateDeployKeyTokenOption{Title: "ci", ReadOnly: true}).
+		AddTokenAuth(token)
+	created := DecodeJSON(t, MakeRequest(t, req, http.StatusCreated), &api.DeployKey{})
+	assert.NotEmpty(t, created.Token)
+	assert.True(t, created.ReadOnly)
+
+	// a token is listed and deleted like a deploy key, but it is never readable again
+	resp := MakeRequest(t, NewRequest(t, "GET", keysURL).AddTokenAuth(token), http.StatusOK)
+	listed := DecodeJSON(t, resp, []api.DeployKey{})
+	assert.Len(t, listed, 1)
+	assert.NotContains(t, resp.Body.String(), created.Token)
+	assert.Equal(t, created.Fingerprint, listed[0].Fingerprint)
+	assert.Contains(t, created.Fingerprint, "********")
+
+	MakeRequest(t, NewRequest(t, "DELETE", fmt.Sprintf("%s/%d", keysURL, created.ID)).AddTokenAuth(token), http.StatusNoContent)
+	resp = MakeRequest(t, NewRequest(t, "GET", keysURL).AddTokenAuth(token), http.StatusOK)
+	assert.Empty(t, DecodeJSON(t, resp, []api.DeployKey{}))
 }

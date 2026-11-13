@@ -9,20 +9,20 @@ import (
 	"strconv"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/tests"
+	auth_model "gitea.dev/models/auth"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
 
-type makeRequestFunc func(testing.TB, *http.Request, int) *httptest.ResponseRecorder
+type makeRequestFunc func(testing.TB, *RequestWrapper, int) *httptest.ResponseRecorder
 
 func TestGPGKeys(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
 	session := loginUser(t, "user2")
-	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeRepo)
-	tokenWithGPGKeyScope := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeAdminGPGKey, auth_model.AccessTokenScopeRepo)
+	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+	tokenWithGPGKeyScope := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository, auth_model.AccessTokenScopeWriteUser)
 
 	tt := []struct {
 		name        string
@@ -36,7 +36,7 @@ func TestGPGKeys(t *testing.T) {
 		},
 		{
 			name: "LoggedAsUser2", makeRequest: session.MakeRequest, token: token,
-			results: []int{http.StatusForbidden, http.StatusOK, http.StatusForbidden, http.StatusForbidden, http.StatusForbidden, http.StatusForbidden, http.StatusForbidden, http.StatusForbidden, http.StatusForbidden},
+			results: []int{http.StatusForbidden, http.StatusForbidden, http.StatusForbidden, http.StatusForbidden, http.StatusForbidden, http.StatusForbidden, http.StatusForbidden, http.StatusForbidden, http.StatusForbidden},
 		},
 		{
 			name: "LoggedAsUser2WithScope", makeRequest: session.MakeRequest, token: tokenWithGPGKeyScope,
@@ -47,121 +47,110 @@ func TestGPGKeys(t *testing.T) {
 	for _, tc := range tt {
 		// Basic test on result code
 		t.Run(tc.name, func(t *testing.T) {
-			t.Run("ViewOwnGPGKeys", func(t *testing.T) {
-				testViewOwnGPGKeys(t, tc.makeRequest, tc.token, tc.results[0])
-			})
-			t.Run("ViewGPGKeys", func(t *testing.T) {
-				testViewGPGKeys(t, tc.makeRequest, tc.token, tc.results[1])
-			})
-			t.Run("GetGPGKey", func(t *testing.T) {
-				testGetGPGKey(t, tc.makeRequest, tc.token, tc.results[2])
-			})
-			t.Run("DeleteGPGKey", func(t *testing.T) {
-				testDeleteGPGKey(t, tc.makeRequest, tc.token, tc.results[3])
-			})
-
-			t.Run("CreateInvalidGPGKey", func(t *testing.T) {
-				testCreateInvalidGPGKey(t, tc.makeRequest, tc.token, tc.results[4])
-			})
-			t.Run("CreateNoneRegistredEmailGPGKey", func(t *testing.T) {
-				testCreateNoneRegistredEmailGPGKey(t, tc.makeRequest, tc.token, tc.results[5])
-			})
-			t.Run("CreateValidGPGKey", func(t *testing.T) {
-				testCreateValidGPGKey(t, tc.makeRequest, tc.token, tc.results[6])
-			})
-			t.Run("CreateValidSecondaryEmailGPGKeyNotActivated", func(t *testing.T) {
-				testCreateValidSecondaryEmailGPGKey(t, tc.makeRequest, tc.token, tc.results[7])
-			})
+			for index, operation := range []struct {
+				name string
+				run  func(*testing.T, makeRequestFunc, string, int)
+			}{
+				{"ViewOwnGPGKeys", testViewOwnGPGKeys},
+				{"ViewGPGKeys", testViewGPGKeys},
+				{"GetGPGKey", testGetGPGKey},
+				{"DeleteGPGKey", testDeleteGPGKey},
+				{"CreateInvalidGPGKey", testCreateInvalidGPGKey},
+				{"CreateNoneRegisteredEmailGPGKey", testCreateNoneRegisteredEmailGPGKey},
+				{"CreateValidGPGKey", testCreateValidGPGKey},
+				{"CreateValidSecondaryEmailGPGKeyNotActivated", testCreateValidSecondaryEmailGPGKey},
+			} {
+				t.Run(operation.name, func(t *testing.T) {
+					operation.run(t, tc.makeRequest, tc.token, tc.results[index])
+				})
+			}
 		})
 	}
 
 	// Check state after basic add
 	t.Run("CheckState", func(t *testing.T) {
-		var keys []*api.GPGKey
-
-		req := NewRequest(t, "GET", "/api/v1/user/gpg_keys?token="+tokenWithGPGKeyScope) // GET all keys
+		req := NewRequest(t, "GET", "/api/v1/user/gpg_keys"). // GET all keys
+									AddTokenAuth(tokenWithGPGKeyScope)
 		resp := MakeRequest(t, req, http.StatusOK)
-		DecodeJSON(t, resp, &keys)
+		keys := DecodeJSON(t, resp, []*api.GPGKey{})
 		assert.Len(t, keys, 1)
 
 		primaryKey1 := keys[0] // Primary key 1
-		assert.EqualValues(t, "38EA3BCED732982C", primaryKey1.KeyID)
+		assert.Equal(t, "38EA3BCED732982C", primaryKey1.KeyID)
 		assert.Len(t, primaryKey1.Emails, 1)
-		assert.EqualValues(t, "user2@example.com", primaryKey1.Emails[0].Email)
+		assert.Equal(t, "user2@example.com", primaryKey1.Emails[0].Email)
 		assert.True(t, primaryKey1.Emails[0].Verified)
 
 		subKey := primaryKey1.SubsKey[0] // Subkey of 38EA3BCED732982C
-		assert.EqualValues(t, "70D7C694D17D03AD", subKey.KeyID)
+		assert.Equal(t, "70D7C694D17D03AD", subKey.KeyID)
 		assert.Empty(t, subKey.Emails)
 
-		var key api.GPGKey
-		req = NewRequest(t, "GET", "/api/v1/user/gpg_keys/"+strconv.FormatInt(primaryKey1.ID, 10)+"?token="+tokenWithGPGKeyScope) // Primary key 1
+		req = NewRequest(t, "GET", "/api/v1/user/gpg_keys/"+strconv.FormatInt(primaryKey1.ID, 10)). // Primary key 1
+														AddTokenAuth(tokenWithGPGKeyScope)
 		resp = MakeRequest(t, req, http.StatusOK)
-		DecodeJSON(t, resp, &key)
-		assert.EqualValues(t, "38EA3BCED732982C", key.KeyID)
+		key := DecodeJSON(t, resp, &api.GPGKey{})
+		assert.Equal(t, "38EA3BCED732982C", key.KeyID)
 		assert.Len(t, key.Emails, 1)
-		assert.EqualValues(t, "user2@example.com", key.Emails[0].Email)
+		assert.Equal(t, "user2@example.com", key.Emails[0].Email)
 		assert.True(t, key.Emails[0].Verified)
 
-		req = NewRequest(t, "GET", "/api/v1/user/gpg_keys/"+strconv.FormatInt(subKey.ID, 10)+"?token="+tokenWithGPGKeyScope) // Subkey of 38EA3BCED732982C
+		req = NewRequest(t, "GET", "/api/v1/user/gpg_keys/"+strconv.FormatInt(subKey.ID, 10)). // Subkey of 38EA3BCED732982C
+													AddTokenAuth(tokenWithGPGKeyScope)
 		resp = MakeRequest(t, req, http.StatusOK)
-		DecodeJSON(t, resp, &key)
-		assert.EqualValues(t, "70D7C694D17D03AD", key.KeyID)
+		key = DecodeJSON(t, resp, &api.GPGKey{})
+		assert.Equal(t, "70D7C694D17D03AD", key.KeyID)
 		assert.Empty(t, key.Emails)
 	})
 
 	// Check state after basic add
 	t.Run("CheckCommits", func(t *testing.T) {
-		t.Run("NotSigned", func(t *testing.T) {
-			var branch api.Branch
-			req := NewRequest(t, "GET", "/api/v1/repos/user2/repo16/branches/not-signed?token="+token)
-			resp := MakeRequest(t, req, http.StatusOK)
-			DecodeJSON(t, resp, &branch)
-			assert.False(t, branch.Commit.Verification.Verified)
-		})
-
-		t.Run("SignedWithNotValidatedEmail", func(t *testing.T) {
-			var branch api.Branch
-			req := NewRequest(t, "GET", "/api/v1/repos/user2/repo16/branches/good-sign-not-yet-validated?token="+token)
-			resp := MakeRequest(t, req, http.StatusOK)
-			DecodeJSON(t, resp, &branch)
-			assert.False(t, branch.Commit.Verification.Verified)
-		})
-
-		t.Run("SignedWithValidEmail", func(t *testing.T) {
-			var branch api.Branch
-			req := NewRequest(t, "GET", "/api/v1/repos/user2/repo16/branches/good-sign?token="+token)
-			resp := MakeRequest(t, req, http.StatusOK)
-			DecodeJSON(t, resp, &branch)
-			assert.True(t, branch.Commit.Verification.Verified)
-		})
+		for _, tc := range []struct {
+			name, branch string
+			assert       assert.BoolAssertionFunc
+		}{
+			{"NotSigned", "not-signed", assert.False},
+			{"SignedWithNotValidatedEmail", "good-sign-not-yet-validated", assert.False},
+			{"SignedWithValidEmail", "good-sign", assert.True},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				req := NewRequest(t, "GET", "/api/v1/repos/user2/repo16/branches/"+tc.branch).
+					AddTokenAuth(token)
+				resp := MakeRequest(t, req, http.StatusOK)
+				branch := DecodeJSON(t, resp, &api.Branch{})
+				tc.assert(t, branch.Commit.Verification.Verified)
+			})
+		}
 	})
 }
 
 func testViewOwnGPGKeys(t *testing.T, makeRequest makeRequestFunc, token string, expected int) {
-	req := NewRequest(t, "GET", "/api/v1/user/gpg_keys?token="+token)
+	req := NewRequest(t, "GET", "/api/v1/user/gpg_keys").
+		AddTokenAuth(token)
 	makeRequest(t, req, expected)
 }
 
 func testViewGPGKeys(t *testing.T, makeRequest makeRequestFunc, token string, expected int) {
-	req := NewRequest(t, "GET", "/api/v1/users/user2/gpg_keys?token="+token)
+	req := NewRequest(t, "GET", "/api/v1/users/user2/gpg_keys").
+		AddTokenAuth(token)
 	makeRequest(t, req, expected)
 }
 
 func testGetGPGKey(t *testing.T, makeRequest makeRequestFunc, token string, expected int) {
-	req := NewRequest(t, "GET", "/api/v1/user/gpg_keys/1?token="+token)
+	req := NewRequest(t, "GET", "/api/v1/user/gpg_keys/1").
+		AddTokenAuth(token)
 	makeRequest(t, req, expected)
 }
 
 func testDeleteGPGKey(t *testing.T, makeRequest makeRequestFunc, token string, expected int) {
-	req := NewRequest(t, "DELETE", "/api/v1/user/gpg_keys/1?token="+token)
+	req := NewRequest(t, "DELETE", "/api/v1/user/gpg_keys/1").
+		AddTokenAuth(token)
 	makeRequest(t, req, expected)
 }
 
 func testCreateGPGKey(t *testing.T, makeRequest makeRequestFunc, token string, expected int, publicKey string) {
-	req := NewRequestWithJSON(t, "POST", "/api/v1/user/gpg_keys?token="+token, api.CreateGPGKeyOption{
+	req := NewRequestWithJSON(t, "POST", "/api/v1/user/gpg_keys", api.CreateGPGKeyOption{
 		ArmoredKey: publicKey,
-	})
+	}).AddTokenAuth(token)
 	makeRequest(t, req, expected)
 }
 
@@ -169,7 +158,7 @@ func testCreateInvalidGPGKey(t *testing.T, makeRequest makeRequestFunc, token st
 	testCreateGPGKey(t, makeRequest, token, expected, "invalid_key")
 }
 
-func testCreateNoneRegistredEmailGPGKey(t *testing.T, makeRequest makeRequestFunc, token string, expected int) {
+func testCreateNoneRegisteredEmailGPGKey(t *testing.T, makeRequest makeRequestFunc, token string, expected int) {
 	testCreateGPGKey(t, makeRequest, token, expected, `-----BEGIN PGP PUBLIC KEY BLOCK-----
 
 mQENBFmGUygBCACjCNbKvMGgp0fd5vyFW9olE1CLCSyyF9gQN2hSuzmZLuAZF2Kh

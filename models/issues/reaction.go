@@ -7,14 +7,15 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/container"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/timeutil"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
 
 	"xorm.io/builder"
 )
@@ -57,25 +58,28 @@ func (err ErrReactionAlreadyExist) Unwrap() error {
 	return util.ErrAlreadyExist
 }
 
-// Reaction represents a reactions on issues and comments.
+// Reaction represents a reaction on an issue, comment or release.
 type Reaction struct {
-	ID               int64              `xorm:"pk autoincr"`
-	Type             string             `xorm:"INDEX UNIQUE(s) NOT NULL"`
-	IssueID          int64              `xorm:"INDEX UNIQUE(s) NOT NULL"`
-	CommentID        int64              `xorm:"INDEX UNIQUE(s)"`
-	UserID           int64              `xorm:"INDEX UNIQUE(s) NOT NULL"`
-	OriginalAuthorID int64              `xorm:"INDEX UNIQUE(s) NOT NULL DEFAULT(0)"`
-	OriginalAuthor   string             `xorm:"INDEX UNIQUE(s)"`
-	User             *user_model.User   `xorm:"-"`
-	CreatedUnix      timeutil.TimeStamp `xorm:"INDEX created"`
+	ID int64 `xorm:"pk autoincr"`
+
+	UserID           int64  `xorm:"UNIQUE(s) NOT NULL"` // first unique column implies INDEX
+	IssueID          int64  `xorm:"UNIQUE(s) INDEX(issue_comment) NOT NULL"`
+	CommentID        int64  `xorm:"UNIQUE(s) INDEX(issue_comment) INDEX NOT NULL"`
+	ReleaseID        int64  `xorm:"UNIQUE(s) INDEX NOT NULL DEFAULT(0)"`
+	OriginalAuthorID int64  `xorm:"UNIQUE(s) NOT NULL DEFAULT(0)"`
+	OriginalAuthor   string `xorm:"UNIQUE(s) NOT NULL DEFAULT('')"`
+	Type             string `xorm:"UNIQUE(s) NOT NULL"`
+
+	User        *user_model.User   `xorm:"-"`
+	CreatedUnix timeutil.TimeStamp `xorm:"INDEX created"`
 }
 
 // LoadUser load user of reaction
-func (r *Reaction) LoadUser() (*user_model.User, error) {
+func (r *Reaction) LoadUser(ctx context.Context) (*user_model.User, error) {
 	if r.User != nil {
 		return r.User, nil
 	}
-	user, err := user_model.GetUserByID(db.DefaultContext, r.UserID)
+	user, err := user_model.GetUserByID(ctx, r.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -107,53 +111,48 @@ func init() {
 // FindReactionsOptions describes the conditions to Find reactions
 type FindReactionsOptions struct {
 	db.ListOptions
-	IssueID   int64
-	CommentID int64
-	UserID    int64
-	Reaction  string
+	IssueIDOnly         int64
+	IssueIDWithComments int64
+	CommentID           int64
+	ReleaseID           int64
+	UserID              int64
 }
 
 func (opts *FindReactionsOptions) toConds() builder.Cond {
 	// If Issue ID is set add to Query
 	cond := builder.NewCond()
-	if opts.IssueID > 0 {
-		cond = cond.And(builder.Eq{"reaction.issue_id": opts.IssueID})
+	if opts.IssueIDOnly > 0 {
+		cond = cond.And(builder.Eq{"reaction.issue_id": opts.IssueIDOnly}).And(builder.Expr("reaction.comment_id = 0"))
 	}
-	// If CommentID is > 0 add to Query
-	// If it is 0 Query ignore CommentID to select
-	// If it is -1 it explicit search of Issue Reactions where CommentID = 0
+	if opts.IssueIDWithComments > 0 {
+		cond = cond.And(builder.Eq{"reaction.issue_id": opts.IssueIDWithComments})
+	}
 	if opts.CommentID > 0 {
 		cond = cond.And(builder.Eq{"reaction.comment_id": opts.CommentID})
-	} else if opts.CommentID == -1 {
-		cond = cond.And(builder.Eq{"reaction.comment_id": 0})
+	}
+	if opts.ReleaseID > 0 {
+		cond = cond.And(builder.Eq{"reaction.release_id": opts.ReleaseID})
 	}
 	if opts.UserID > 0 {
-		cond = cond.And(builder.Eq{
-			"reaction.user_id":            opts.UserID,
-			"reaction.original_author_id": 0,
-		})
+		cond = cond.And(builder.Eq{"reaction.user_id": opts.UserID, "reaction.original_author_id": 0})
 	}
-	if opts.Reaction != "" {
-		cond = cond.And(builder.Eq{"reaction.type": opts.Reaction})
+	if !cond.IsValid() {
+		setting.PanicInDevOrTesting("FindReactionsOptions.toConds: no conditions specified")
+		cond = cond.And(builder.Expr("1=0"))
 	}
-
 	return cond
 }
 
-// FindCommentReactions returns a ReactionList of all reactions from an comment
-func FindCommentReactions(issueID, commentID int64) (ReactionList, int64, error) {
-	return FindReactions(db.DefaultContext, FindReactionsOptions{
-		IssueID:   issueID,
-		CommentID: commentID,
-	})
+// FindCommentReactions returns a ReactionList of all reactions from a comment
+func FindCommentReactions(ctx context.Context, commentID int64) (ReactionList, int64, error) {
+	return FindReactions(ctx, FindReactionsOptions{CommentID: commentID})
 }
 
 // FindIssueReactions returns a ReactionList of all reactions from an issue
-func FindIssueReactions(issueID int64, listOptions db.ListOptions) (ReactionList, int64, error) {
-	return FindReactions(db.DefaultContext, FindReactionsOptions{
+func FindIssueReactions(ctx context.Context, issueID int64, listOptions db.ListOptions) (ReactionList, int64, error) {
+	return FindReactions(ctx, FindReactionsOptions{
 		ListOptions: listOptions,
-		IssueID:     issueID,
-		CommentID:   -1,
+		IssueIDOnly: issueID,
 	})
 }
 
@@ -163,8 +162,8 @@ func FindReactions(ctx context.Context, opts FindReactionsOptions) (ReactionList
 		Where(opts.toConds()).
 		In("reaction.`type`", setting.UI.Reactions).
 		Asc("reaction.issue_id", "reaction.comment_id", "reaction.created_unix", "reaction.id")
-	if opts.Page != 0 {
-		sess = db.SetSessionPagination(sess, &opts)
+	if opts.Page > 0 {
+		db.SetSessionPagination(sess, &opts)
 
 		reactions := make([]*Reaction, 0, opts.PageSize)
 		count, err := sess.FindAndCount(&reactions)
@@ -176,37 +175,14 @@ func FindReactions(ctx context.Context, opts FindReactionsOptions) (ReactionList
 	return reactions, count, err
 }
 
-func createReaction(ctx context.Context, opts *ReactionOptions) (*Reaction, error) {
-	reaction := &Reaction{
-		Type:      opts.Type,
-		UserID:    opts.DoerID,
-		IssueID:   opts.IssueID,
-		CommentID: opts.CommentID,
-	}
-	findOpts := FindReactionsOptions{
-		IssueID:   opts.IssueID,
-		CommentID: opts.CommentID,
-		Reaction:  opts.Type,
-		UserID:    opts.DoerID,
-	}
-	if findOpts.CommentID == 0 {
-		// explicit search of Issue Reactions where CommentID = 0
-		findOpts.CommentID = -1
-	}
-
-	existingR, _, err := FindReactions(ctx, findOpts)
-	if err != nil {
-		return nil, err
-	}
-	if len(existingR) > 0 {
-		return existingR[0], ErrReactionAlreadyExist{Reaction: opts.Type}
-	}
-
-	if err := db.Insert(ctx, reaction); err != nil {
-		return nil, err
-	}
-
-	return reaction, nil
+func FindReleaseReactions(ctx context.Context, releaseIDs ...int64) (ReactionList, error) {
+	reactions := make(ReactionList, 0, 10)
+	err := db.GetEngine(ctx).
+		In("release_id", releaseIDs).
+		In("`type`", setting.UI.ReleaseReactions).
+		Asc("created_unix", "id").
+		Find(&reactions)
+	return reactions, err
 }
 
 // ReactionOptions defines options for creating or deleting reactions
@@ -215,87 +191,63 @@ type ReactionOptions struct {
 	DoerID    int64
 	IssueID   int64
 	CommentID int64
+	ReleaseID int64
 }
 
-// CreateReaction creates reaction for issue or comment.
-func CreateReaction(opts *ReactionOptions) (*Reaction, error) {
-	if !setting.UI.ReactionsLookup.Contains(opts.Type) {
+// CreateReaction creates reaction for issue, comment or release.
+func CreateReaction(ctx context.Context, allowed container.Set[string], opts *ReactionOptions) (*Reaction, error) {
+	if !allowed.Contains(opts.Type) {
 		return nil, ErrForbiddenIssueReaction{opts.Type}
 	}
 
-	ctx, committer, err := db.TxContext(db.DefaultContext)
-	if err != nil {
-		return nil, err
-	}
-	defer committer.Close()
-
-	reaction, err := createReaction(ctx, opts)
-	if err != nil {
-		return reaction, err
-	}
-
-	if err := committer.Commit(); err != nil {
-		return nil, err
-	}
-	return reaction, nil
-}
-
-// CreateIssueReaction creates a reaction on issue.
-func CreateIssueReaction(doerID, issueID int64, content string) (*Reaction, error) {
-	return CreateReaction(&ReactionOptions{
-		Type:    content,
-		DoerID:  doerID,
-		IssueID: issueID,
-	})
-}
-
-// CreateCommentReaction creates a reaction on comment.
-func CreateCommentReaction(doerID, issueID, commentID int64, content string) (*Reaction, error) {
-	return CreateReaction(&ReactionOptions{
-		Type:      content,
-		DoerID:    doerID,
-		IssueID:   issueID,
-		CommentID: commentID,
-	})
-}
-
-// DeleteReaction deletes reaction for issue or comment.
-func DeleteReaction(ctx context.Context, opts *ReactionOptions) error {
 	reaction := &Reaction{
 		Type:      opts.Type,
 		UserID:    opts.DoerID,
 		IssueID:   opts.IssueID,
 		CommentID: opts.CommentID,
+		ReleaseID: opts.ReleaseID,
 	}
 
-	sess := db.GetEngine(ctx).Where("original_author_id = 0")
-	if opts.CommentID == -1 {
-		reaction.CommentID = 0
-		sess.MustCols("comment_id")
+	err := db.Insert(ctx, reaction)
+	if err != nil {
+		if has, _ := db.GetEngine(ctx).Get(reaction); has {
+			return reaction, ErrReactionAlreadyExist{Reaction: opts.Type}
+		}
+		return nil, err
 	}
+	return reaction, nil
+}
 
-	_, err := sess.Delete(reaction)
+func DeleteIssueReaction(ctx context.Context, doerID, issueID int64, content string) error {
+	// here and below: the migration reactions have unrelated user_id (might be the doer?)
+	// so skip the deletion if the reaction is from an external user (original_author_id != 0)
+	sess := db.GetEngine(ctx).Where("issue_id = ? AND comment_id = 0 AND user_id = ? AND original_author_id = 0 AND `type` = ?", issueID, doerID, content)
+	_, err := sess.Delete(&Reaction{})
 	return err
 }
 
-// DeleteIssueReaction deletes a reaction on issue.
-func DeleteIssueReaction(doerID, issueID int64, content string) error {
-	return DeleteReaction(db.DefaultContext, &ReactionOptions{
-		Type:      content,
-		DoerID:    doerID,
-		IssueID:   issueID,
-		CommentID: -1,
-	})
+func DeleteCommentReaction(ctx context.Context, doerID, issueID, commentID int64, content string) error {
+	sess := db.GetEngine(ctx).Where("issue_id = ? AND comment_id = ? AND user_id = ? AND original_author_id = 0 AND `type` = ?", issueID, commentID, doerID, content)
+	_, err := sess.Delete(&Reaction{})
+	return err
 }
 
-// DeleteCommentReaction deletes a reaction on comment.
-func DeleteCommentReaction(doerID, issueID, commentID int64, content string) error {
-	return DeleteReaction(db.DefaultContext, &ReactionOptions{
-		Type:      content,
-		DoerID:    doerID,
-		IssueID:   issueID,
-		CommentID: commentID,
-	})
+func DeleteCommentAllReactions(ctx context.Context, commentID int64) error {
+	sess := db.GetEngine(ctx).Where("comment_id = ?", commentID)
+	_, err := sess.Delete(&Reaction{})
+	return err
+}
+
+func DeleteUserReactions(ctx context.Context, userID int64) error {
+	sess := db.GetEngine(ctx).Where("user_id = ?", userID)
+	_, err := sess.Delete(&Reaction{})
+	return err
+}
+
+func DeleteReleaseReaction(ctx context.Context, doerID, releaseID int64, content string) error {
+	sess := db.GetEngine(ctx).Where("release_id = ? AND user_id = ? AND `type` = ?", releaseID, doerID, content)
+	_, err := sess.Delete(&Reaction{})
+	return err
 }
 
 // ReactionList represents list of reactions
@@ -324,28 +276,23 @@ func (list ReactionList) GroupByType() map[string]ReactionList {
 }
 
 func (list ReactionList) getUserIDs() []int64 {
-	userIDs := make(container.Set[int64], len(list))
-	for _, reaction := range list {
+	return container.FilterSlice(list, func(reaction *Reaction) (int64, bool) {
 		if reaction.OriginalAuthor != "" {
-			continue
+			return 0, false
 		}
-		userIDs.Add(reaction.UserID)
-	}
-	return userIDs.Values()
+		return reaction.UserID, true
+	})
 }
 
-func valuesUser(m map[int64]*user_model.User) []*user_model.User {
-	values := make([]*user_model.User, 0, len(m))
-	for _, v := range m {
-		values = append(values, v)
-	}
-	return values
+// newMigrationOriginalUser creates and returns a fake user for external user
+func newMigrationOriginalUser(name string) *user_model.User {
+	return &user_model.User{ID: 0, Name: name, LowerName: strings.ToLower(name)}
 }
 
 // LoadUsers loads reactions' all users
-func (list ReactionList) LoadUsers(ctx context.Context, repo *repo_model.Repository) ([]*user_model.User, error) {
+func (list ReactionList) LoadUsers(ctx context.Context, repo *repo_model.Repository) (map[int64]*user_model.User, error) {
 	if len(list) == 0 {
-		return nil, nil
+		return map[int64]*user_model.User{}, nil
 	}
 
 	userIDs := list.getUserIDs()
@@ -359,14 +306,14 @@ func (list ReactionList) LoadUsers(ctx context.Context, repo *repo_model.Reposit
 
 	for _, reaction := range list {
 		if reaction.OriginalAuthor != "" {
-			reaction.User = user_model.NewReplaceUser(fmt.Sprintf("%s(%s)", reaction.OriginalAuthor, repo.OriginalServiceType.Name()))
+			reaction.User = newMigrationOriginalUser(fmt.Sprintf("%s(%s)", reaction.OriginalAuthor, repo.OriginalServiceType.Name()))
 		} else if user, ok := userMaps[reaction.UserID]; ok {
 			reaction.User = user
 		} else {
 			reaction.User = user_model.NewGhostUser()
 		}
 	}
-	return valuesUser(userMaps), nil
+	return userMaps, nil
 }
 
 // GetFirstUsers returns first reacted user display names separated by comma
@@ -377,7 +324,7 @@ func (list ReactionList) GetFirstUsers() string {
 		if buffer.Len() > 0 {
 			buffer.WriteString(", ")
 		}
-		buffer.WriteString(reaction.User.DisplayName())
+		buffer.WriteString(reaction.User.DisplayNameWithFullName())
 		if rem--; rem == 0 {
 			break
 		}

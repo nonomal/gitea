@@ -48,21 +48,15 @@ func TestComplexity_Generate(t *testing.T) {
 	const maxCount = 50
 	const pwdLen = 50
 
-	test := func(t *testing.T, modes []string) {
+	for _, modes := range [][]string{{"lower"}, {"upper"}, {"lower", "upper", "spec"}, {"off"}, {""}} {
 		testComplextity(modes)
-		for i := 0; i < maxCount; i++ {
+		for range maxCount {
 			pwd, err := Generate(pwdLen)
 			assert.NoError(t, err)
 			assert.Len(t, pwd, pwdLen)
 			assert.True(t, IsComplexEnough(pwd), "Failed complexities with modes %+v for generated: %s", modes, pwd)
 		}
 	}
-
-	test(t, []string{"lower"})
-	test(t, []string{"upper"})
-	test(t, []string{"lower", "upper", "spec"})
-	test(t, []string{"off"})
-	test(t, []string{""})
 
 	// Remove settings for other tests
 	testComplextity([]string{"off"})

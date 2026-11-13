@@ -8,13 +8,13 @@ import (
 	"net/http"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	issues_model "code.gitea.io/gitea/models/issues"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/tests"
+	auth_model "gitea.dev/models/auth"
+	issues_model "gitea.dev/models/issues"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -31,22 +31,21 @@ func TestAPIIssueSubscriptions(t *testing.T) {
 	owner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: issue1.PosterID})
 
 	session := loginUser(t, owner.Name)
-	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeRepo)
+	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteIssue)
 
 	testSubscription := func(issue *issues_model.Issue, isWatching bool) {
 		issueRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: issue.RepoID})
 
-		urlStr := fmt.Sprintf("/api/v1/repos/%s/%s/issues/%d/subscriptions/check?token=%s", issueRepo.OwnerName, issueRepo.Name, issue.Index, token)
-		req := NewRequest(t, "GET", urlStr)
+		req := NewRequest(t, "GET", fmt.Sprintf("/api/v1/repos/%s/%s/issues/%d/subscriptions/check", issueRepo.OwnerName, issueRepo.Name, issue.Index)).
+			AddTokenAuth(token)
 		resp := MakeRequest(t, req, http.StatusOK)
-		wi := new(api.WatchInfo)
-		DecodeJSON(t, resp, wi)
+		wi := DecodeJSON(t, resp, &api.WatchInfo{})
 
-		assert.EqualValues(t, isWatching, wi.Subscribed)
-		assert.EqualValues(t, !isWatching, wi.Ignored)
-		assert.EqualValues(t, issue.APIURL()+"/subscriptions", wi.URL)
+		assert.Equal(t, isWatching, wi.Subscribed)
+		assert.Equal(t, !isWatching, wi.Ignored)
+		assert.Equal(t, issue.APIURL(t.Context())+"/subscriptions", wi.URL)
 		assert.EqualValues(t, issue.CreatedUnix, wi.CreatedAt.Unix())
-		assert.EqualValues(t, issueRepo.APIURL(), wi.RepositoryURL)
+		assert.Equal(t, issueRepo.APIURL(), wi.RepositoryURL)
 	}
 
 	testSubscription(issue1, true)
@@ -56,22 +55,20 @@ func TestAPIIssueSubscriptions(t *testing.T) {
 	testSubscription(issue5, false)
 
 	issue1Repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: issue1.RepoID})
-	urlStr := fmt.Sprintf("/api/v1/repos/%s/%s/issues/%d/subscriptions/%s?token=%s", issue1Repo.OwnerName, issue1Repo.Name, issue1.Index, owner.Name, token)
-	req := NewRequest(t, "DELETE", urlStr)
-	MakeRequest(t, req, http.StatusCreated)
-	testSubscription(issue1, false)
-
-	req = NewRequest(t, "DELETE", urlStr)
-	MakeRequest(t, req, http.StatusOK)
-	testSubscription(issue1, false)
+	urlStr := fmt.Sprintf("/api/v1/repos/%s/%s/issues/%d/subscriptions/%s", issue1Repo.OwnerName, issue1Repo.Name, issue1.Index, owner.Name)
+	for _, expectedCode := range []int{http.StatusCreated, http.StatusOK} {
+		req := NewRequest(t, "DELETE", urlStr).
+			AddTokenAuth(token)
+		MakeRequest(t, req, expectedCode)
+		testSubscription(issue1, false)
+	}
 
 	issue5Repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: issue5.RepoID})
-	urlStr = fmt.Sprintf("/api/v1/repos/%s/%s/issues/%d/subscriptions/%s?token=%s", issue5Repo.OwnerName, issue5Repo.Name, issue5.Index, owner.Name, token)
-	req = NewRequest(t, "PUT", urlStr)
-	MakeRequest(t, req, http.StatusCreated)
-	testSubscription(issue5, true)
-
-	req = NewRequest(t, "PUT", urlStr)
-	MakeRequest(t, req, http.StatusOK)
-	testSubscription(issue5, true)
+	urlStr = fmt.Sprintf("/api/v1/repos/%s/%s/issues/%d/subscriptions/%s", issue5Repo.OwnerName, issue5Repo.Name, issue5.Index, owner.Name)
+	for _, expectedCode := range []int{http.StatusCreated, http.StatusOK} {
+		req := NewRequest(t, "PUT", urlStr).
+			AddTokenAuth(token)
+		MakeRequest(t, req, expectedCode)
+		testSubscription(issue5, true)
+	}
 }

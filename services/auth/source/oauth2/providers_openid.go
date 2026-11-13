@@ -4,8 +4,11 @@
 package oauth2
 
 import (
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
+	"html/template"
+
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/svg"
 
 	"github.com/markbates/goth"
 	"github.com/markbates/goth/providers/openidConnect"
@@ -13,6 +16,10 @@ import (
 
 // OpenIDProvider is a GothProvider for OpenID
 type OpenIDProvider struct{}
+
+func (o *OpenIDProvider) SupportSSHPublicKey() bool {
+	return true
+}
 
 // Name provides the technical name for this provider
 func (o *OpenIDProvider) Name() string {
@@ -24,9 +31,9 @@ func (o *OpenIDProvider) DisplayName() string {
 	return "OpenID Connect"
 }
 
-// Image returns an image path for this provider
-func (o *OpenIDProvider) Image() string {
-	return "/assets/img/auth/openid_connect.svg"
+// IconHTML returns icon HTML for this provider
+func (o *OpenIDProvider) IconHTML(size int) template.HTML {
+	return svg.RenderHTML("gitea-openid", size)
 }
 
 // CreateGothProvider creates a GothProvider from this Provider
@@ -39,8 +46,14 @@ func (o *OpenIDProvider) CreateGothProvider(providerName, callbackURL string, so
 	provider, err := openidConnect.New(source.ClientID, source.ClientSecret, callbackURL, source.OpenIDConnectAutoDiscoveryURL, scopes...)
 	if err != nil {
 		log.Warn("Failed to create OpenID Connect Provider with name '%s' with url '%s': %v", providerName, source.OpenIDConnectAutoDiscoveryURL, err)
+		return nil, err
 	}
-	return provider, err
+	if source.ExternalIDClaim != "" {
+		// UserIdClaims is a fallback list; goth returns the first non-empty matching claim.
+		// A single entry is sufficient because the admin explicitly chooses one claim (e.g. "oid" for Azure AD).
+		provider.UserIdClaims = []string{source.ExternalIDClaim}
+	}
+	return provider, nil
 }
 
 // CustomURLSettings returns the custom url settings for this provider
@@ -48,7 +61,7 @@ func (o *OpenIDProvider) CustomURLSettings() *CustomURLSettings {
 	return nil
 }
 
-var _ (GothProvider) = &OpenIDProvider{}
+var _ GothProvider = &OpenIDProvider{}
 
 func init() {
 	RegisterGothProvider(&OpenIDProvider{})

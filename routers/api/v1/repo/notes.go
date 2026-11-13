@@ -4,13 +4,12 @@
 package repo
 
 import (
-	"fmt"
 	"net/http"
 
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/git"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/services/convert"
+	"gitea.dev/modules/git"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
 )
 
 // GetNote Get a note corresponding to a single commit from a repository
@@ -36,53 +35,54 @@ func GetNote(ctx *context.APIContext) {
 	//   description: a git ref or commit sha
 	//   type: string
 	//   required: true
+	// - name: verification
+	//   in: query
+	//   description: include verification for every commit (disable for speedup, default 'true')
+	//   type: boolean
+	// - name: files
+	//   in: query
+	//   description: include a list of affected files for every commit (disable for speedup, default 'true')
+	//   type: boolean
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/Note"
-	//   "422":
-	//     "$ref": "#/responses/validationError"
-	//   "404":
-	//     "$ref": "#/responses/notFound"
+	//   default:
+	//     "$ref": "#/responses/error"
 
-	sha := ctx.Params(":sha")
+	sha := ctx.PathParam("sha")
 	if !git.IsValidRefPattern(sha) {
-		ctx.Error(http.StatusUnprocessableEntity, "no valid ref or sha", fmt.Sprintf("no valid ref or sha: %s", sha))
+		ctx.APIError(http.StatusUnprocessableEntity, "no valid ref or sha: "+sha)
 		return
 	}
 	getNote(ctx, sha)
 }
 
-func getNote(ctx *context.APIContext, identifier string) {
-	if ctx.Repo.GitRepo == nil {
-		ctx.InternalServerError(fmt.Errorf("no open git repo"))
-		return
-	}
-
-	commitSHA, err := ctx.Repo.GitRepo.ConvertToSHA1(identifier)
+func getNote(ctx *context.APIContext, ref string) {
+	commit, err := ctx.Repo.GitRepo.GetCommit(ctx, ref)
 	if err != nil {
-		if git.IsErrNotExist(err) {
-			ctx.NotFound(err)
-		} else {
-			ctx.Error(http.StatusInternalServerError, "ConvertToSHA1", err)
-		}
+		ctx.APIErrorAuto(err)
 		return
 	}
 
-	var note git.Note
-	if err := git.GetNote(ctx, ctx.Repo.GitRepo, commitSHA.String(), &note); err != nil {
-		if git.IsErrNotExist(err) {
-			ctx.NotFound(identifier)
-			return
-		}
-		ctx.Error(http.StatusInternalServerError, "GetNote", err)
-		return
-	}
-
-	cmt, err := convert.ToCommit(ctx, ctx.Repo.Repository, ctx.Repo.GitRepo, note.Commit, nil, true)
+	note, lastCommit, err := git.GetNoteWithLastCommit(ctx, ctx.Repo.GitRepo, commit.ID.String())
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "ToCommit", err)
+		ctx.APIErrorAuto(err)
 		return
 	}
-	apiNote := api.Note{Message: string(note.Message), Commit: cmt}
+
+	verification := ctx.FormString("verification") == "" || ctx.FormBool("verification")
+	files := ctx.FormString("files") == "" || ctx.FormBool("files")
+
+	cmt, err := convert.ToCommit(ctx, ctx.Repo.Repository, ctx.Repo.GitRepo, lastCommit, nil,
+		convert.ToCommitOptions{
+			Stat:         true,
+			Verification: verification,
+			Files:        files,
+		})
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	apiNote := api.Note{Message: note.BlobMessage.MessageUTF8(), Commit: cmt}
 	ctx.JSON(http.StatusOK, apiNote)
 }

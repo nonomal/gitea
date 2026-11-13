@@ -120,9 +120,17 @@ func TestCutDiffAroundLine(t *testing.T) {
 	assert.Empty(t, emptyResult)
 
 	// Line is out of scope
-	emptyResult, err = CutDiffAroundLine(strings.NewReader(exampleDiff), 434, false, 0)
+	emptyResult, err = CutDiffAroundLine(strings.NewReader(exampleDiff), 7, false, 3)
 	assert.NoError(t, err)
 	assert.Empty(t, emptyResult)
+
+	noNewlineDiff := "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+a"
+	result, err = CutDiffAroundLine(strings.NewReader(noNewlineDiff), 1, false, 2)
+	assert.NoError(t, err)
+	assert.Equal(t, "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,1 +1,1 @@\n-a\n\\ No newline at end of file\n+a", result)
+	result, err = CutDiffAroundLine(strings.NewReader(noNewlineDiff), 1, true, 2)
+	assert.NoError(t, err)
+	assert.Equal(t, "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a", result)
 
 	// Handle minus diffs properly
 	minusDiff, err := CutDiffAroundLine(strings.NewReader(breakingDiff), 2, false, 4)
@@ -154,7 +162,7 @@ func TestCutDiffAroundLine(t *testing.T) {
 }
 
 func BenchmarkCutDiffAroundLine(b *testing.B) {
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		CutDiffAroundLine(strings.NewReader(exampleDiff), 3, true, 3)
 	}
 }
@@ -177,8 +185,8 @@ func ExampleCutDiffAroundLine() {
 
 func TestParseDiffHunkString(t *testing.T) {
 	leftLine, leftHunk, rightLine, rightHunk := ParseDiffHunkString("@@ -19,3 +19,5 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER")
-	assert.EqualValues(t, 19, leftLine)
-	assert.EqualValues(t, 3, leftHunk)
-	assert.EqualValues(t, 19, rightLine)
-	assert.EqualValues(t, 5, rightHunk)
+	assert.Equal(t, 19, leftLine)
+	assert.Equal(t, 3, leftHunk)
+	assert.Equal(t, 19, rightLine)
+	assert.Equal(t, 5, rightHunk)
 }

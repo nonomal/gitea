@@ -4,11 +4,13 @@
 package activities
 
 import (
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/organization"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/timeutil"
+	"context"
+
+	"gitea.dev/models/db"
+	"gitea.dev/models/organization"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
 )
 
 // UserHeatmapData represents the data needed to create a heatmap
@@ -17,17 +19,17 @@ type UserHeatmapData struct {
 	Contributions int64              `json:"contributions"`
 }
 
-// GetUserHeatmapDataByUser returns an array of UserHeatmapData
-func GetUserHeatmapDataByUser(user, doer *user_model.User) ([]*UserHeatmapData, error) {
-	return getUserHeatmapData(user, nil, doer)
+// GetUserHeatmapDataByUser returns an array of UserHeatmapData, it checks whether doer can access user's activity
+func GetUserHeatmapDataByUser(ctx context.Context, user, doer *user_model.User) ([]*UserHeatmapData, error) {
+	return getUserHeatmapData(ctx, user, nil, doer)
 }
 
-// GetUserHeatmapDataByUserTeam returns an array of UserHeatmapData
-func GetUserHeatmapDataByUserTeam(user *user_model.User, team *organization.Team, doer *user_model.User) ([]*UserHeatmapData, error) {
-	return getUserHeatmapData(user, team, doer)
+// GetUserHeatmapDataByOrgTeam returns an array of UserHeatmapData, it checks whether doer can access org's activity
+func GetUserHeatmapDataByOrgTeam(ctx context.Context, org *organization.Organization, team *organization.Team, doer *user_model.User) ([]*UserHeatmapData, error) {
+	return getUserHeatmapData(ctx, org.AsUser(), team, doer)
 }
 
-func getUserHeatmapData(user *user_model.User, team *organization.Team, doer *user_model.User) ([]*UserHeatmapData, error) {
+func getUserHeatmapData(ctx context.Context, user *user_model.User, team *organization.Team, doer *user_model.User) ([]*UserHeatmapData, error) {
 	hdata := make([]*UserHeatmapData, 0)
 
 	if !ActivityReadable(user, doer) {
@@ -45,7 +47,7 @@ func getUserHeatmapData(user *user_model.User, team *organization.Team, doer *us
 		groupByName = groupBy
 	}
 
-	cond, err := activityQueryCondition(GetFeedsOptions{
+	cond, err := ActivityQueryCondition(ctx, GetFeedsOptions{
 		RequestedUser:  user,
 		RequestedTeam:  team,
 		Actor:          doer,
@@ -60,21 +62,13 @@ func getUserHeatmapData(user *user_model.User, team *organization.Team, doer *us
 		return nil, err
 	}
 
-	return hdata, db.GetEngine(db.DefaultContext).
+	// HINT: USER-ACTIVITY-PUSH-COMMITS: it only uses the doer's action time, it doesn't use git commit's time
+	return hdata, db.GetEngine(ctx).
 		Select(groupBy+" AS timestamp, count(user_id) as contributions").
 		Table("action").
 		Where(cond).
-		And("created_unix > ?", timeutil.TimeStampNow()-31536000).
+		And("created_unix > ?", timeutil.TimeStampNow()-(366+7)*86400). // (366+7) days to include the first week for the heatmap
 		GroupBy(groupByName).
 		OrderBy("timestamp").
 		Find(&hdata)
-}
-
-// GetTotalContributionsInHeatmap returns the total number of contributions in a heatmap
-func GetTotalContributionsInHeatmap(hdata []*UserHeatmapData) int64 {
-	var total int64
-	for _, v := range hdata {
-		total += v.Contributions
-	}
-	return total
 }

@@ -7,20 +7,24 @@ import (
 	"strings"
 	"testing"
 
-	"code.gitea.io/gitea/modules/packages/container/helm"
+	"gitea.dev/modules/packages"
+	"gitea.dev/modules/packages/container/helm"
 
 	oci "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseImageConfig(t *testing.T) {
 	description := "Image Description"
 	author := "Gitea"
 	license := "MIT"
-	projectURL := "https://gitea.io"
+	projectURL := "https://gitea.com"
 	repositoryURL := "https://gitea.com/gitea"
-	documentationURL := "https://docs.gitea.io"
+	documentationURL := "https://docs.gitea.com"
 
+	// FIXME: JSON-KEY-CASE: the test case is not right, the config fields are capitalized in the spec
+	// https://github.com/opencontainers/image-spec/blob/main/schema/config-schema.json
 	configOCI := `{"config": {"labels": {"` + labelAuthors + `": "` + author + `", "` + labelLicenses + `": "` + license + `", "` + labelURL + `": "` + projectURL + `", "` + labelSource + `": "` + repositoryURL + `", "` + labelDocumentation + `": "` + documentationURL + `", "` + labelDescription + `": "` + description + `"}}, "history": [{"created_by": "do it 1"}, {"created_by": "dummy #(nop) do it 2"}]}`
 
 	metadata, err := ParseImageConfig(oci.MediaTypeImageManifest, strings.NewReader(configOCI))
@@ -58,4 +62,11 @@ func TestParseImageConfig(t *testing.T) {
 	assert.ElementsMatch(t, []string{author}, metadata.Authors)
 	assert.Equal(t, projectURL, metadata.ProjectURL)
 	assert.Equal(t, repositoryURL, metadata.RepositoryURL)
+
+	metadata, err = ParseImageConfig("anything-unknown", strings.NewReader(""))
+	require.NoError(t, err)
+	assert.Equal(t, &Metadata{Platform: "unknown/unknown"}, metadata)
+
+	_, err = ParseImageConfig(oci.MediaTypeImageConfig, strings.NewReader(`{"history": [{"created_by": "`+strings.Repeat("a", maxImageConfigSize)+`"}]}`))
+	assert.ErrorIs(t, err, packages.ErrContentTooLarge)
 }

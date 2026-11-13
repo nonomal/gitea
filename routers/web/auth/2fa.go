@@ -7,33 +7,36 @@ import (
 	"errors"
 	"net/http"
 
-	"code.gitea.io/gitea/models/auth"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/externalaccount"
-	"code.gitea.io/gitea/services/forms"
+	audit_model "gitea.dev/models/audit"
+	"gitea.dev/models/auth"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/session"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/audit"
+	"gitea.dev/services/context"
+	"gitea.dev/services/forms"
 )
 
 var (
-	tplTwofa        base.TplName = "user/auth/twofa"
-	tplTwofaScratch base.TplName = "user/auth/twofa_scratch"
+	tplTwofa        templates.TplName = "user/auth/twofa"
+	tplTwofaScratch templates.TplName = "user/auth/twofa_scratch"
 )
 
 // TwoFactor shows the user a two-factor authentication page.
 func TwoFactor(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("twofa")
 
-	// Check auto-login.
-	if checkAutoLogin(ctx) {
+	if performAutoLogin(ctx) {
 		return
 	}
 
 	// Ensure user is in a 2FA session.
 	if ctx.Session.Get("twofaUid") == nil {
-		ctx.ServerError("UserSignIn", errors.New("not in 2FA session"))
+		ctx.ServerErrorAuto(errors.New("not in 2FA session"))
 		return
 	}
 
@@ -42,71 +45,66 @@ func TwoFactor(ctx *context.Context) {
 
 // TwoFactorPost validates a user's two-factor authentication token.
 func TwoFactorPost(ctx *context.Context) {
-	form := web.GetForm(ctx).(*forms.TwoFactorAuthForm)
+	form := web.GetForm[*forms.TwoFactorAuthForm](ctx)
 	ctx.Data["Title"] = ctx.Tr("twofa")
 
 	// Ensure user is in a 2FA session.
-	idSess := ctx.Session.Get("twofaUid")
-	if idSess == nil {
-		ctx.ServerError("UserSignIn", errors.New("not in 2FA session"))
+	id, hasSession := ctx.Session.Get("twofaUid").(int64)
+	if !hasSession {
+		ctx.ServerErrorAuto(errors.New("not in 2FA session"))
 		return
 	}
 
-	id := idSess.(int64)
-	twofa, err := auth.GetTwoFactorByUID(id)
+	twofa, err := auth.GetTwoFactorByUID(ctx, id)
 	if err != nil {
-		ctx.ServerError("UserSignIn", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
-	// Validate the passcode with the stored TOTP secret.
-	ok, err := twofa.ValidateTOTP(form.Passcode)
+	// Validate the passcode and atomically consume it to prevent reuse/replay.
+	tfaResult, err := twofa.ValidateAndConsumeTOTP(ctx, form.Passcode)
 	if err != nil {
-		ctx.ServerError("UserSignIn", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
-	if ok && twofa.LastUsedPasscode != form.Passcode {
-		remember := ctx.Session.Get("twofaRemember").(bool)
+	if tfaResult == auth.TwoFactorResultValid {
+		remember := ctx.Session.Get("twofaRemember").(bool) //nolint:forcetypeassert // must exist
 		u, err := user_model.GetUserByID(ctx, id)
 		if err != nil {
-			ctx.ServerError("UserSignIn", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 
-		if ctx.Session.Get("linkAccount") != nil {
-			err = externalaccount.LinkAccountFromStore(ctx.Session, u)
-			if err != nil {
-				ctx.ServerError("UserSignIn", err)
-				return
-			}
-		}
-
-		twofa.LastUsedPasscode = form.Passcode
-		if err = auth.UpdateTwoFactor(twofa); err != nil {
-			ctx.ServerError("UserSignIn", err)
+		if err = completePendingLinks(ctx, u); err != nil {
+			ctx.ServerErrorAuto(err)
 			return
 		}
 
+		_ = ctx.Session.Set(session.KeyUserHasTwoFactorAuth, true)
 		handleSignIn(ctx, u, remember)
 		return
 	}
 
-	ctx.RenderWithErr(ctx.Tr("auth.twofa_passcode_incorrect"), tplTwofa, forms.TwoFactorAuthForm{})
+	if u, err := user_model.GetUserByID(ctx, id); err == nil {
+		audit.RecordAs(ctx, u, audit_model.UserAuthenticationFailTwoFactor, u)
+		log.Warn("Failed authentication attempt for %s from %s: invalid two-factor passcode", u.Name, ctx.RemoteAddr())
+	}
+	errMsg := ctx.Tr(util.Iif(tfaResult == auth.TwoFactorResultTooManyAttempts, "auth.twofa_too_many_attempts", "auth.twofa_passcode_incorrect"))
+	ctx.RenderWithErrDeprecated(errMsg, tplTwofa, forms.TwoFactorAuthForm{})
 }
 
 // TwoFactorScratch shows the scratch code form for two-factor authentication.
 func TwoFactorScratch(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("twofa_scratch")
 
-	// Check auto-login.
-	if checkAutoLogin(ctx) {
+	if performAutoLogin(ctx) {
 		return
 	}
 
 	// Ensure user is in a 2FA session.
 	if ctx.Session.Get("twofaUid") == nil {
-		ctx.ServerError("UserSignIn", errors.New("not in 2FA session"))
+		ctx.ServerErrorAuto(errors.New("not in 2FA session"))
 		return
 	}
 
@@ -115,20 +113,19 @@ func TwoFactorScratch(ctx *context.Context) {
 
 // TwoFactorScratchPost validates and invalidates a user's two-factor scratch token.
 func TwoFactorScratchPost(ctx *context.Context) {
-	form := web.GetForm(ctx).(*forms.TwoFactorScratchAuthForm)
+	form := web.GetForm[*forms.TwoFactorScratchAuthForm](ctx)
 	ctx.Data["Title"] = ctx.Tr("twofa_scratch")
 
 	// Ensure user is in a 2FA session.
-	idSess := ctx.Session.Get("twofaUid")
-	if idSess == nil {
-		ctx.ServerError("UserSignIn", errors.New("not in 2FA session"))
+	id, hasSession := ctx.Session.Get("twofaUid").(int64)
+	if !hasSession {
+		ctx.ServerErrorAuto(errors.New("not in 2FA session"))
 		return
 	}
 
-	id := idSess.(int64)
-	twofa, err := auth.GetTwoFactorByUID(id)
+	twofa, err := auth.GetTwoFactorByUID(ctx, id)
 	if err != nil {
-		ctx.ServerError("UserSignIn", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
@@ -137,22 +134,27 @@ func TwoFactorScratchPost(ctx *context.Context) {
 		// Invalidate the scratch token.
 		_, err = twofa.GenerateScratchToken()
 		if err != nil {
-			ctx.ServerError("UserSignIn", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
-		if err = auth.UpdateTwoFactor(twofa); err != nil {
-			ctx.ServerError("UserSignIn", err)
+		if err = auth.UpdateTwoFactor(ctx, twofa); err != nil {
+			ctx.ServerErrorAuto(err)
 			return
 		}
 
-		remember := ctx.Session.Get("twofaRemember").(bool)
+		remember := ctx.Session.Get("twofaRemember").(bool) //nolint:forcetypeassert // must exist
 		u, err := user_model.GetUserByID(ctx, id)
 		if err != nil {
-			ctx.ServerError("UserSignIn", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 
-		handleSignInFull(ctx, u, remember, false)
+		if err = completePendingLinks(ctx, u); err != nil {
+			ctx.ServerErrorAuto(err)
+			return
+		}
+
+		handleSignInFull(ctx, u, remember)
 		if ctx.Written() {
 			return
 		}
@@ -161,5 +163,5 @@ func TwoFactorScratchPost(ctx *context.Context) {
 		return
 	}
 
-	ctx.RenderWithErr(ctx.Tr("auth.twofa_scratch_token_incorrect"), tplTwofaScratch, forms.TwoFactorScratchAuthForm{})
+	ctx.RenderWithErrDeprecated(ctx.Tr("auth.twofa_scratch_token_incorrect"), tplTwofaScratch, forms.TwoFactorScratchAuthForm{})
 }

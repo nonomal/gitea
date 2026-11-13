@@ -4,122 +4,66 @@
 package auth
 
 import (
-	"fmt"
+	"context"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/timeutil"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/timeutil"
+
+	"xorm.io/builder"
 )
 
-// Session represents a session compatible for go-chi session
 type Session struct {
-	Key    string             `xorm:"pk CHAR(16)"` // has to be Key to match with go-chi/session
-	Data   []byte             `xorm:"BLOB"`        // on MySQL this has a maximum size of 64Kb - this may need to be increased
-	Expiry timeutil.TimeStamp // has to be Expiry to match with go-chi/session
+	Key            string             `xorm:"pk CHAR(16)"` // the limit is from legacy go-chi/session
+	Data           []byte             `xorm:"BLOB"`        // on MySQL this has a maximum size of 64Kb
+	LastAccessTime timeutil.TimeStamp `xorm:"expiry"`      // last access time, the field name is from legacy go-chi/session, we don't want to change it at the moment
 }
+
+const DbSessionLastAccessTime = "expiry" // maybe we can make a deeper clean up in the future, just keep this PR focused
 
 func init() {
 	db.RegisterModel(new(Session))
 }
 
-// UpdateSession updates the session with provided id
-func UpdateSession(key string, data []byte) error {
-	_, err := db.GetEngine(db.DefaultContext).ID(key).Update(&Session{
-		Data:   data,
-		Expiry: timeutil.TimeStampNow(),
-	})
+// UpdateSession stores the data of the session with provided id, creating the session only if create is set
+func UpdateSession(ctx context.Context, key string, data []byte, create bool) error {
+	session := &Session{Key: key, Data: data, LastAccessTime: timeutil.TimeStampNow()}
+	update := func() (int64, error) {
+		return db.GetEngine(ctx).ID(key).Cols("data", DbSessionLastAccessTime).Update(session)
+	}
+	if updated, err := update(); err != nil || updated > 0 || !create {
+		return err
+	}
+	insertErr := db.Insert(ctx, session)
+	if insertErr == nil {
+		return nil
+	}
+	// the row exists if a concurrent request inserted it, or if MySQL reported an unchanged row as not updated
+	if exist, err := db.Exist[Session](ctx, builder.Eq{"`key`": key}); err != nil || !exist {
+		return insertErr
+	}
+	_, err := update()
 	return err
 }
 
-// ReadSession reads the data for the provided session
-func ReadSession(key string) (*Session, error) {
-	session := Session{
-		Key: key,
-	}
-
-	ctx, committer, err := db.TxContext(db.DefaultContext)
-	if err != nil {
-		return nil, err
-	}
-	defer committer.Close()
-
-	if has, err := db.GetByBean(ctx, &session); err != nil {
-		return nil, err
-	} else if !has {
-		session.Expiry = timeutil.TimeStampNow()
-		if err := db.Insert(ctx, &session); err != nil {
-			return nil, err
-		}
-	}
-
-	return &session, committer.Commit()
+func UpdateSessionLastAccessTime(ctx context.Context, key string) error {
+	_, err := db.GetEngine(ctx).ID(key).Cols(DbSessionLastAccessTime).Update(&Session{LastAccessTime: timeutil.TimeStampNow()})
+	return err
 }
 
-// ExistSession checks if a session exists
-func ExistSession(key string) (bool, error) {
-	session := Session{
-		Key: key,
-	}
-	return db.GetEngine(db.DefaultContext).Get(&session)
+func GetSession(ctx context.Context, key string) (*Session, bool, error) {
+	return db.Get[Session](ctx, builder.Eq{"`key`": key})
 }
 
 // DestroySession destroys a session
-func DestroySession(key string) error {
-	_, err := db.GetEngine(db.DefaultContext).Delete(&Session{
+func DestroySession(ctx context.Context, key string) error {
+	_, err := db.GetEngine(ctx).Delete(&Session{
 		Key: key,
 	})
 	return err
 }
 
-// RegenerateSession regenerates a session from the old id
-func RegenerateSession(oldKey, newKey string) (*Session, error) {
-	ctx, committer, err := db.TxContext(db.DefaultContext)
-	if err != nil {
-		return nil, err
-	}
-	defer committer.Close()
-
-	if has, err := db.GetByBean(ctx, &Session{
-		Key: newKey,
-	}); err != nil {
-		return nil, err
-	} else if has {
-		return nil, fmt.Errorf("session Key: %s already exists", newKey)
-	}
-
-	if has, err := db.GetByBean(ctx, &Session{
-		Key: oldKey,
-	}); err != nil {
-		return nil, err
-	} else if !has {
-		if err := db.Insert(ctx, &Session{
-			Key:    oldKey,
-			Expiry: timeutil.TimeStampNow(),
-		}); err != nil {
-			return nil, err
-		}
-	}
-
-	if _, err := db.Exec(ctx, "UPDATE "+db.TableName(&Session{})+" SET `key` = ? WHERE `key`=?", newKey, oldKey); err != nil {
-		return nil, err
-	}
-
-	s := Session{
-		Key: newKey,
-	}
-	if _, err := db.GetByBean(ctx, &s); err != nil {
-		return nil, err
-	}
-
-	return &s, committer.Commit()
-}
-
-// CountSessions returns the number of sessions
-func CountSessions() (int64, error) {
-	return db.GetEngine(db.DefaultContext).Count(&Session{})
-}
-
 // CleanupSessions cleans up expired sessions
-func CleanupSessions(maxLifetime int64) error {
-	_, err := db.GetEngine(db.DefaultContext).Where("expiry <= ?", timeutil.TimeStampNow().Add(-maxLifetime)).Delete(&Session{})
+func CleanupSessions(ctx context.Context, maxLifetime int64) error {
+	_, err := db.GetEngine(ctx).Where(DbSessionLastAccessTime+" <= ?", timeutil.TimeStampNow().Add(-maxLifetime)).Delete(&Session{})
 	return err
 }

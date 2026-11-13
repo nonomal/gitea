@@ -4,51 +4,63 @@
 package secrets
 
 import (
-	"net/http"
-
-	"code.gitea.io/gitea/models/db"
-	secret_model "code.gitea.io/gitea/models/secret"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/forms"
+	actions_model "gitea.dev/models/actions"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	secret_model "gitea.dev/models/secret"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/audit"
+	"gitea.dev/services/context"
+	"gitea.dev/services/forms"
+	secret_service "gitea.dev/services/secrets"
 )
 
-func SetSecretsContext(ctx *context.Context, ownerID, repoID int64) {
-	secrets, err := secret_model.FindSecrets(ctx, secret_model.FindSecretsOptions{OwnerID: ownerID, RepoID: repoID})
+func SetSecretsContext(ctx *context.Context, scope actions_model.BelongingScope) {
+	secrets, err := db.Find[secret_model.Secret](ctx, secret_model.FindSecretsOptions{BelongingScope: scope})
 	if err != nil {
-		ctx.ServerError("FindSecrets", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
 	ctx.Data["Secrets"] = secrets
+	ctx.Data["DataMaxLength"] = secret_model.SecretDataMaxLength
+	ctx.Data["DescriptionMaxLength"] = secret_model.SecretDescriptionMaxLength
 }
 
-func PerformSecretsPost(ctx *context.Context, ownerID, repoID int64, redirectURL string) {
-	form := web.GetForm(ctx).(*forms.AddSecretForm)
+func PerformSecretsPost(ctx *context.Context, scope actions_model.BelongingScope, owner *user_model.User, repo *repo_model.Repository, redirectURL string) {
+	form := web.GetForm[*forms.AddSecretForm](ctx)
 
-	s, err := secret_model.InsertEncryptedSecret(ctx, ownerID, repoID, form.Title, form.Content)
+	s, created, err := secret_service.CreateOrUpdateSecret(ctx, scope, form.Name, util.NormalizeStringEOL(form.Data), form.Description)
 	if err != nil {
-		log.Error("InsertEncryptedSecret: %v", err)
-		ctx.Flash.Error(ctx.Tr("secrets.creation.failed"))
-	} else {
-		ctx.Flash.Success(ctx.Tr("secrets.creation.success", s.Name))
+		ctx.JSONErrorAuto(err)
+		return
 	}
 
-	ctx.Redirect(redirectURL)
+	actions := audit.SecretUpdate
+	if created {
+		actions = audit.SecretAdd
+	}
+	audit.RecordScoped(ctx, owner, repo, actions, "secret", s.Name)
+
+	ctx.Flash.Success(ctx.Tr("secrets.save_success", s.Name))
+	ctx.JSONRedirect(redirectURL)
 }
 
-func PerformSecretsDelete(ctx *context.Context, ownerID, repoID int64, redirectURL string) {
+func PerformSecretsDelete(ctx *context.Context, scope actions_model.BelongingScope, owner *user_model.User, repo *repo_model.Repository, redirectURL string) {
 	id := ctx.FormInt64("id")
 
-	if _, err := db.DeleteByBean(ctx, &secret_model.Secret{ID: id, OwnerID: ownerID, RepoID: repoID}); err != nil {
-		log.Error("Delete secret %d failed: %v", id, err)
-		ctx.Flash.Error(ctx.Tr("secrets.deletion.failed"))
-	} else {
-		ctx.Flash.Success(ctx.Tr("secrets.deletion.success"))
+	s, err := secret_service.DeleteSecretByID(ctx, scope, id)
+	if err != nil {
+		log.Error("DeleteSecretByID(%d) failed: %v", id, err)
+		ctx.JSONError(ctx.Tr("secrets.deletion.failed"))
+		return
 	}
 
-	ctx.JSON(http.StatusOK, map[string]interface{}{
-		"redirect": redirectURL,
-	})
+	audit.RecordScoped(ctx, owner, repo, audit.SecretRemove, "secret", s.Name)
+
+	ctx.Flash.Success(ctx.Tr("secrets.deletion.success"))
+	ctx.JSONRedirect(redirectURL)
 }

@@ -6,14 +6,15 @@ package git
 import (
 	"context"
 	"regexp"
+	"slices"
 	"strings"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/organization"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/timeutil"
+	"gitea.dev/models/db"
+	"gitea.dev/models/organization"
+	"gitea.dev/modules/glob"
+	"gitea.dev/modules/timeutil"
 
-	"github.com/gobwas/glob"
+	"xorm.io/builder"
 )
 
 // ProtectedTag struct
@@ -76,7 +77,7 @@ func DeleteProtectedTag(ctx context.Context, pt *ProtectedTag) error {
 
 // IsUserAllowedModifyTag returns true if the user is allowed to modify the tag
 func IsUserAllowedModifyTag(ctx context.Context, pt *ProtectedTag, userID int64) (bool, error) {
-	if base.Int64sContains(pt.AllowlistUserIDs, userID) {
+	if slices.Contains(pt.AllowlistUserIDs, userID) {
 		return true, nil
 	}
 
@@ -105,7 +106,19 @@ func GetProtectedTagByID(ctx context.Context, id int64) (*ProtectedTag, error) {
 		return nil, err
 	}
 	if !has {
-		return nil, nil
+		return nil, nil //nolint:nilnil // return nil to indicate that the object does not exist
+	}
+	return tag, nil
+}
+
+// GetProtectedTagByNamePattern gets protected tag by name_pattern
+func GetProtectedTagByNamePattern(ctx context.Context, repoID int64, pattern string) (*ProtectedTag, error) {
+	tag, has, err := db.Get[ProtectedTag](ctx, builder.Eq{"name_pattern": pattern, "repo_id": repoID})
+	if err != nil {
+		return nil, err
+	}
+	if !has {
+		return nil, nil //nolint:nilnil // return nil to indicate that the object does not exist
 	}
 	return tag, nil
 }

@@ -5,26 +5,20 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
 
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
 )
 
 var _ ObjectStorage = &LocalStorage{}
-
-// LocalStorageType is the type descriptor for local storage
-const LocalStorageType Type = "local"
-
-// LocalStorageConfig represents the configuration for a local storage
-type LocalStorageConfig struct {
-	Path          string `ini:"PATH"`
-	TemporaryPath string `ini:"TEMPORARY_PATH"`
-}
 
 // LocalStorage represents a local files storage
 type LocalStorage struct {
@@ -34,32 +28,33 @@ type LocalStorage struct {
 }
 
 // NewLocalStorage returns a local files
-func NewLocalStorage(ctx context.Context, cfg interface{}) (ObjectStorage, error) {
-	configInterface, err := toConfig(LocalStorageConfig{}, cfg)
-	if err != nil {
-		return nil, err
-	}
-	config := configInterface.(LocalStorageConfig)
-
+func NewLocalStorage(ctx context.Context, config *setting.Storage) (ObjectStorage, error) {
+	// prepare storage root path
 	if !filepath.IsAbs(config.Path) {
-		return nil, fmt.Errorf("LocalStorageConfig.Path should have been prepared by setting/storage.go and should be an absolute path, but not: %q", config.Path)
+		return nil, fmt.Errorf("LocalStorage config.Path should have been prepared by setting/storage.go and should be an absolute path, but not: %q", config.Path)
 	}
-	log.Info("Creating new Local Storage at %s", config.Path)
-	if err := os.MkdirAll(config.Path, os.ModePerm); err != nil {
-		return nil, err
-	}
+	storageRoot := util.FilePathJoinAbs(config.Path)
 
-	if config.TemporaryPath == "" {
-		config.TemporaryPath = filepath.Join(config.Path, "tmp")
+	// prepare storage temporary path
+	storageTmp := config.TemporaryPath
+	if storageTmp == "" {
+		storageTmp = filepath.Join(storageRoot, "tmp")
 	}
-	if !filepath.IsAbs(config.TemporaryPath) {
-		return nil, fmt.Errorf("LocalStorageConfig.TemporaryPath should be an absolute path, but not: %q", config.TemporaryPath)
+	if !filepath.IsAbs(storageTmp) {
+		return nil, fmt.Errorf("LocalStorage config.TemporaryPath should be an absolute path, but not: %q", config.TemporaryPath)
+	}
+	storageTmp = util.FilePathJoinAbs(storageTmp)
+
+	// create the storage root if not exist
+	log.Info("Creating new Local Storage at %s", storageRoot)
+	if err := os.MkdirAll(storageRoot, os.ModePerm); err != nil {
+		return nil, err
 	}
 
 	return &LocalStorage{
 		ctx:    ctx,
-		dir:    config.Path,
-		tmpdir: config.TemporaryPath,
+		dir:    storageRoot,
+		tmpdir: storageTmp,
 	}, nil
 }
 
@@ -90,7 +85,7 @@ func (l *LocalStorage) Save(path string, r io.Reader, size int64) (int64, error)
 	tmpRemoved := false
 	defer func() {
 		if !tmpRemoved {
-			_ = util.Remove(tmp.Name())
+			_ = util.RemoveWithRetry(tmp.Name())
 		}
 	}()
 
@@ -103,7 +98,7 @@ func (l *LocalStorage) Save(path string, r io.Reader, size int64) (int64, error)
 		return 0, err
 	}
 
-	if err := util.Rename(tmp.Name(), p); err != nil {
+	if err := util.RenameWithRetry(tmp.Name(), p); err != nil {
 		return 0, err
 	}
 	// Golang's tmp file (os.CreateTemp) always have 0o600 mode, so we need to change the file to follow the umask (as what Create/MkDir does)
@@ -122,47 +117,62 @@ func (l *LocalStorage) Stat(path string) (os.FileInfo, error) {
 	return os.Stat(l.buildLocalPath(path))
 }
 
-// Delete delete a file
-func (l *LocalStorage) Delete(path string) error {
-	return util.Remove(l.buildLocalPath(path))
+func (l *LocalStorage) deleteEmptyParentDirs(localFullPath string) {
+	for parent := filepath.Dir(localFullPath); len(parent) > len(l.dir); parent = filepath.Dir(parent) {
+		if err := os.Remove(parent); err != nil && !os.IsNotExist(err) {
+			// since the target file has been deleted, parent dir error is not related to the file deletion itself.
+			break
+		}
+	}
 }
 
-// URL gets the redirect URL to a file
-func (l *LocalStorage) URL(path, name string) (*url.URL, error) {
+// Delete deletes the file in storage and removes the empty parent directories (if possible)
+func (l *LocalStorage) Delete(path string) error {
+	localFullPath := l.buildLocalPath(path)
+	err := util.RemoveWithRetry(localFullPath)
+	l.deleteEmptyParentDirs(localFullPath)
+	return err
+}
+
+func (l *LocalStorage) ServeDirectURL(path, name, _ string, reqParams *ServeDirectOptions) (*url.URL, error) {
 	return nil, ErrURLNotSupported
 }
 
+func (l *LocalStorage) normalizeWalkError(err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		// ignore it because the file may be deleted during the walk, and we don't care about it
+		return nil
+	}
+	return err
+}
+
 // IterateObjects iterates across the objects in the local storage
-func (l *LocalStorage) IterateObjects(prefix string, fn func(path string, obj Object) error) error {
-	dir := l.buildLocalPath(prefix)
-	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
+func (l *LocalStorage) IterateObjects(dirName string, fn func(path string, obj Object) error) error {
+	dir := l.buildLocalPath(dirName)
+	return filepath.WalkDir(dir, func(path string, d os.DirEntry, errWalk error) error {
+		if err := l.ctx.Err(); err != nil {
 			return err
 		}
-		select {
-		case <-l.ctx.Done():
-			return l.ctx.Err()
-		default:
+		if errWalk != nil {
+			return l.normalizeWalkError(errWalk)
 		}
-		if path == l.dir {
+		if path == l.dir || d.IsDir() {
 			return nil
 		}
-		if d.IsDir() {
-			return nil
-		}
+
 		relPath, err := filepath.Rel(l.dir, path)
 		if err != nil {
-			return err
+			return l.normalizeWalkError(err)
 		}
 		obj, err := os.Open(path)
 		if err != nil {
-			return err
+			return l.normalizeWalkError(err)
 		}
 		defer obj.Close()
-		return fn(relPath, obj)
+		return fn(filepath.ToSlash(relPath), obj)
 	})
 }
 
 func init() {
-	RegisterStorageType(LocalStorageType, NewLocalStorage)
+	RegisterStorageType(setting.LocalStorageType, NewLocalStorage)
 }

@@ -4,19 +4,25 @@
 package composer
 
 import (
-	"archive/zip"
 	"bytes"
+	"compress/gzip"
+	"io"
 	"strings"
 	"testing"
 
-	"code.gitea.io/gitea/modules/json"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/test"
 
+	"github.com/dsnet/compress/bzip2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
 	name        = "gitea/composer-package"
 	description = "Package Description"
+	readme      = "Package Readme"
+	comments    = "Package Comment"
 	packageType = "composer-plugin"
 	author      = "Gitea Authors"
 	email       = "no.reply@gitea.io"
@@ -24,8 +30,10 @@ const (
 	license     = "MIT"
 )
 
-const composerContent = `{
+func buildComposerContent(version string) string {
+	return `{
     "name": "` + name + `",
+		"version": "` + version + `",
     "description": "` + description + `",
     "type": "` + packageType + `",
     "license": "` + license + `",
@@ -41,8 +49,10 @@ const composerContent = `{
     },
     "require": {
         "php": ">=7.2 || ^8.0"
-    }
+    },
+    "_comment": "` + comments + `"
 }`
+}
 
 func TestLicenseUnmarshal(t *testing.T) {
 	var l Licenses
@@ -54,70 +64,62 @@ func TestLicenseUnmarshal(t *testing.T) {
 	assert.Equal(t, "MIT", l[0])
 }
 
-func TestParsePackage(t *testing.T) {
-	createArchive := func(name, content string) []byte {
-		var buf bytes.Buffer
-		archive := zip.NewWriter(&buf)
-		w, _ := archive.Create(name)
-		w.Write([]byte(content))
-		archive.Close()
-		return buf.Bytes()
-	}
-
-	t.Run("MissingComposerFile", func(t *testing.T) {
-		data := createArchive("dummy.txt", "")
-
-		cp, err := ParsePackage(bytes.NewReader(data), int64(len(data)))
-		assert.Nil(t, cp)
-		assert.ErrorIs(t, err, ErrMissingComposerFile)
-	})
-
-	t.Run("MissingComposerFileInRoot", func(t *testing.T) {
-		data := createArchive("sub/sub/composer.json", "")
-
-		cp, err := ParsePackage(bytes.NewReader(data), int64(len(data)))
-		assert.Nil(t, cp)
-		assert.ErrorIs(t, err, ErrMissingComposerFile)
-	})
-
-	t.Run("InvalidComposerFile", func(t *testing.T) {
-		data := createArchive("composer.json", "")
-
-		cp, err := ParsePackage(bytes.NewReader(data), int64(len(data)))
-		assert.Nil(t, cp)
-		assert.Error(t, err)
-	})
-
-	t.Run("Valid", func(t *testing.T) {
-		data := createArchive("composer.json", composerContent)
-
-		cp, err := ParsePackage(bytes.NewReader(data), int64(len(data)))
-		assert.NoError(t, err)
-		assert.NotNil(t, cp)
-	})
+func TestCommentsUnmarshal(t *testing.T) {
+	var c Comments
+	assert.NoError(t, json.NewDecoder(strings.NewReader(`["comment"]`)).Decode(&c))
+	assert.Len(t, c, 1)
+	assert.Equal(t, "comment", c[0])
+	assert.NoError(t, json.NewDecoder(strings.NewReader(`"comment"`)).Decode(&c))
+	assert.Len(t, c, 1)
+	assert.Equal(t, "comment", c[0])
 }
 
-func TestParseComposerFile(t *testing.T) {
-	t.Run("InvalidPackageName", func(t *testing.T) {
-		cp, err := ParseComposerFile(strings.NewReader(`{}`))
-		assert.Nil(t, cp)
-		assert.ErrorIs(t, err, ErrInvalidName)
-	})
+func TestParsePackage(t *testing.T) {
+	for _, tc := range []struct {
+		name, filename, content string
+		expectedError           error
+	}{
+		{"MissingComposerFile", "dummy.txt", "", ErrMissingComposerFile},
+		{"MissingComposerFileInRoot", "sub/sub/composer.json", "", ErrMissingComposerFile},
+		{"InvalidComposerFile", "composer.json", "", nil},
+		{"InvalidPackageName", "composer.json", "{}", ErrInvalidName},
+		{"InvalidPackageVersion", "composer.json", `{"name": "gitea/composer-package", "version": "1.a.3"}`, ErrInvalidVersion},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := test.WriteZipArchive(map[string]string{tc.filename: tc.content}).Bytes()
 
-	t.Run("InvalidPackageVersion", func(t *testing.T) {
-		cp, err := ParseComposerFile(strings.NewReader(`{"name": "gitea/composer-package", "version": "1.a.3"}`))
-		assert.Nil(t, cp)
-		assert.ErrorIs(t, err, ErrInvalidVersion)
-	})
+			cp, err := ParsePackage(bytes.NewReader(data))
+			assert.Nil(t, cp)
+			if tc.expectedError == nil {
+				assert.Error(t, err)
+			} else {
+				assert.ErrorIs(t, err, tc.expectedError)
+			}
+		})
+	}
 
-	t.Run("Valid", func(t *testing.T) {
-		cp, err := ParseComposerFile(strings.NewReader(composerContent))
+	t.Run("InvalidReadmePath", func(t *testing.T) {
+		data := test.WriteZipArchive(map[string]string{"composer.json": `{"name": "gitea/composer-package", "readme": "sub/README.md"}`}).Bytes()
+
+		cp, err := ParsePackage(bytes.NewReader(data))
 		assert.NoError(t, err)
 		assert.NotNil(t, cp)
 
+		assert.Empty(t, cp.Metadata.Readme)
+	})
+
+	assertValidPackage := func(t *testing.T, data []byte, version, filename string) {
+		cp, err := ParsePackage(bytes.NewReader(data))
+		require.NoError(t, err)
+		assert.NotNil(t, cp)
+
+		assert.Equal(t, filename, cp.Filename)
 		assert.Equal(t, name, cp.Name)
-		assert.Empty(t, cp.Version)
+		assert.Equal(t, version, cp.Version)
 		assert.Equal(t, description, cp.Metadata.Description)
+		assert.Equal(t, readme, cp.Metadata.Readme)
+		assert.Len(t, cp.Metadata.Comments, 1)
+		assert.Equal(t, comments, cp.Metadata.Comments[0])
 		assert.Len(t, cp.Metadata.Authors, 1)
 		assert.Equal(t, author, cp.Metadata.Authors[0].Name)
 		assert.Equal(t, email, cp.Metadata.Authors[0].Email)
@@ -125,5 +127,32 @@ func TestParseComposerFile(t *testing.T) {
 		assert.Equal(t, packageType, cp.Type)
 		assert.Len(t, cp.Metadata.License, 1)
 		assert.Equal(t, license, cp.Metadata.License[0])
+	}
+
+	t.Run("ValidZip", func(t *testing.T) {
+		data := test.WriteZipArchive(map[string]string{"composer.json": buildComposerContent(""), "README.md": readme}).Bytes()
+		assertValidPackage(t, data, "", "gitea-composer-package.zip")
+	})
+
+	t.Run("ValidTarBz2", func(t *testing.T) {
+		data := test.WriteTarCompression(func(w io.Writer) io.WriteCloser {
+			bz2Writer, _ := bzip2.NewWriter(w, nil)
+			return bz2Writer
+		}, map[string]string{"composer.json": buildComposerContent("1.0"), "README.md": readme}).Bytes()
+		assertValidPackage(t, data, "1.0", "gitea-composer-package.1.0.tar.bz2")
+	})
+
+	t.Run("ValidTarGz", func(t *testing.T) {
+		data := test.WriteTarCompression(func(w io.Writer) io.WriteCloser {
+			return gzip.NewWriter(w)
+		}, map[string]string{"composer.json": buildComposerContent(""), "README.md": readme}).Bytes()
+		assertValidPackage(t, data, "", "gitea-composer-package.tar.gz")
+	})
+
+	t.Run("ReadmeEncoding", func(t *testing.T) {
+		data := test.WriteZipArchive(map[string]string{"composer.json": buildComposerContent(""), "README.md": "🌞🌞"[:6]}).Bytes()
+		cp, err := ParsePackage(bytes.NewReader(data))
+		require.NoError(t, err)
+		assert.Equal(t, "🌞 ", cp.Metadata.Readme)
 	})
 }

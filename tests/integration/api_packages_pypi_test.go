@@ -13,14 +13,14 @@ import (
 	"strings"
 	"testing"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/packages"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/packages/pypi"
-	"code.gitea.io/gitea/tests"
+	"gitea.dev/models/packages"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/packages/pypi"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestPackagePyPI(t *testing.T) {
@@ -32,15 +32,16 @@ func TestPackagePyPI(t *testing.T) {
 	packageVersion := "1!1.0.1+r1234"
 	packageAuthor := "KN4CK3R"
 	packageDescription := "Test Description"
+	projectURL := "https://example.com"
 
 	content := "test"
 	hashSHA256 := "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 
 	root := fmt.Sprintf("/api/packages/%s/pypi", user.Name)
 
-	uploadFile := func(t *testing.T, filename, content string, expectedStatus int) {
-		body := &bytes.Buffer{}
-		writer := multipart.NewWriter(body)
+	createBasicMultipartFile := func(filename, packageName, content string) (body *bytes.Buffer, writer *multipart.Writer, closer func() error) {
+		body = &bytes.Buffer{}
+		writer = multipart.NewWriter(body)
 		part, _ := writer.CreateFormFile("content", filename)
 		_, _ = io.Copy(part, strings.NewReader(content))
 
@@ -52,72 +53,76 @@ func TestPackagePyPI(t *testing.T) {
 		writer.WriteField("sha256_digest", hashSHA256)
 		writer.WriteField("requires_python", "3.6")
 
-		_ = writer.Close()
+		return body, writer, writer.Close
+	}
 
-		req := NewRequestWithBody(t, "POST", root, body)
-		req.Header.Add("Content-Type", writer.FormDataContentType())
-		req = AddBasicAuthHeader(req, user.Name)
+	uploadHelper := func(t *testing.T, body *bytes.Buffer, contentType string, expectedStatus int) {
+		req := NewRequestWithBody(t, "POST", root, body).
+			SetHeader("Content-Type", contentType).
+			AddBasicAuth(user.Name)
 		MakeRequest(t, req, expectedStatus)
 	}
 
-	t.Run("Upload", func(t *testing.T) {
-		defer tests.PrintCurrentTest(t)()
+	uploadFile := func(t *testing.T, filename, content string, expectedStatus int) {
+		body, writer, closeFunc := createBasicMultipartFile(filename, packageName, content)
 
-		filename := "test.whl"
-		uploadFile(t, filename, content, http.StatusCreated)
+		writer.WriteField("project_urls", "DOCUMENTATION , https://readthedocs.org")
+		writer.WriteField("project_urls", "Home-page, "+projectURL)
 
-		pvs, err := packages.GetVersionsByPackageType(db.DefaultContext, user.ID, packages.TypePyPI)
-		assert.NoError(t, err)
-		assert.Len(t, pvs, 1)
+		_ = closeFunc()
 
-		pd, err := packages.GetPackageDescriptor(db.DefaultContext, pvs[0])
-		assert.NoError(t, err)
-		assert.Nil(t, pd.SemVer)
-		assert.IsType(t, &pypi.Metadata{}, pd.Metadata)
-		assert.Equal(t, packageName, pd.Package.Name)
-		assert.Equal(t, packageVersion, pd.Version.Version)
+		uploadHelper(t, body, writer.FormDataContentType(), expectedStatus)
+	}
 
-		pfs, err := packages.GetFilesByVersionID(db.DefaultContext, pvs[0].ID)
-		assert.NoError(t, err)
-		assert.Len(t, pfs, 1)
-		assert.Equal(t, filename, pfs[0].Name)
-		assert.True(t, pfs[0].IsLead)
+	for _, upload := range []struct {
+		name      string
+		filename  string
+		fileCount int
+	}{
+		{"Upload", "test.whl", 1},
+		{"UploadAddFile", "test.tar.gz", 2},
+	} {
+		t.Run(upload.name, func(t *testing.T) {
+			defer tests.PrintCurrentTest(t)()
 
-		pb, err := packages.GetBlobByID(db.DefaultContext, pfs[0].BlobID)
-		assert.NoError(t, err)
-		assert.Equal(t, int64(4), pb.Size)
-	})
+			uploadFile(t, upload.filename, content, http.StatusCreated)
 
-	t.Run("UploadAddFile", func(t *testing.T) {
-		defer tests.PrintCurrentTest(t)()
+			pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypePyPI)
+			assert.NoError(t, err)
+			assert.Len(t, pvs, 1)
 
-		filename := "test.tar.gz"
-		uploadFile(t, filename, content, http.StatusCreated)
+			pd, err := packages.GetPackageDescriptor(t.Context(), pvs[0])
+			assert.NoError(t, err)
+			assert.Nil(t, pd.SemVer)
+			if upload.fileCount == 1 {
+				metadata, ok := pd.Metadata.(*pypi.Metadata)
+				require.True(t, ok)
+				assert.Equal(t, projectURL, metadata.ProjectURL)
+			} else {
+				assert.IsType(t, &pypi.Metadata{}, pd.Metadata)
+			}
+			assert.Equal(t, packageName, pd.Package.Name)
+			assert.Equal(t, packageVersion, pd.Version.Version)
 
-		pvs, err := packages.GetVersionsByPackageType(db.DefaultContext, user.ID, packages.TypePyPI)
-		assert.NoError(t, err)
-		assert.Len(t, pvs, 1)
+			pfs, err := packages.GetFilesByVersionID(t.Context(), pvs[0].ID)
+			assert.NoError(t, err)
+			assert.Len(t, pfs, upload.fileCount)
 
-		pd, err := packages.GetPackageDescriptor(db.DefaultContext, pvs[0])
-		assert.NoError(t, err)
-		assert.Nil(t, pd.SemVer)
-		assert.IsType(t, &pypi.Metadata{}, pd.Metadata)
-		assert.Equal(t, packageName, pd.Package.Name)
-		assert.Equal(t, packageVersion, pd.Version.Version)
+			var pf *packages.PackageFile
+			if upload.fileCount == 1 {
+				pf = pfs[0]
+			} else {
+				pf, err = packages.GetFileForVersionByName(t.Context(), pvs[0].ID, upload.filename, packages.EmptyFileKey)
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, upload.filename, pf.Name)
+			assert.True(t, pf.IsLead)
 
-		pfs, err := packages.GetFilesByVersionID(db.DefaultContext, pvs[0].ID)
-		assert.NoError(t, err)
-		assert.Len(t, pfs, 2)
-
-		pf, err := packages.GetFileForVersionByName(db.DefaultContext, pvs[0].ID, filename, packages.EmptyFileKey)
-		assert.NoError(t, err)
-		assert.Equal(t, filename, pf.Name)
-		assert.True(t, pf.IsLead)
-
-		pb, err := packages.GetBlobByID(db.DefaultContext, pf.BlobID)
-		assert.NoError(t, err)
-		assert.Equal(t, int64(4), pb.Size)
-	})
+			pb, err := packages.GetBlobByID(t.Context(), pf.BlobID)
+			assert.NoError(t, err)
+			assert.Equal(t, int64(4), pb.Size)
+		})
+	}
 
 	t.Run("UploadHashMismatch", func(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
@@ -129,16 +134,60 @@ func TestPackagePyPI(t *testing.T) {
 	t.Run("UploadExists", func(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
 
-		uploadFile(t, "test.whl", content, http.StatusBadRequest)
-		uploadFile(t, "test.tar.gz", content, http.StatusBadRequest)
+		uploadFile(t, "test.whl", content, http.StatusConflict)
+		uploadFile(t, "test.tar.gz", content, http.StatusConflict)
+	})
+
+	t.Run("UploadUsingDeprecatedHomepageMetadata", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		pkgName := "homepage-package"
+		body, writer, closeFunc := createBasicMultipartFile("test.whl", pkgName, content)
+
+		writer.WriteField("home_page", projectURL)
+
+		_ = closeFunc()
+
+		uploadHelper(t, body, writer.FormDataContentType(), http.StatusCreated)
+
+		pvs, err := packages.GetVersionsByPackageName(t.Context(), user.ID, packages.TypePyPI, pkgName)
+		assert.NoError(t, err)
+		assert.Len(t, pvs, 1)
+
+		pd, err := packages.GetPackageDescriptor(t.Context(), pvs[0])
+		assert.NoError(t, err)
+		metadata, ok := pd.Metadata.(*pypi.Metadata)
+		require.True(t, ok)
+		assert.Equal(t, projectURL, metadata.ProjectURL)
+	})
+
+	t.Run("UploadWithoutAnyHomepageURLMetadata", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		pkgName := "no-project-url-or-homepage-package"
+		body, writer, closeFunc := createBasicMultipartFile("test.whl", pkgName, content)
+
+		_ = closeFunc()
+
+		uploadHelper(t, body, writer.FormDataContentType(), http.StatusCreated)
+
+		pvs, err := packages.GetVersionsByPackageName(t.Context(), user.ID, packages.TypePyPI, pkgName)
+		assert.NoError(t, err)
+		assert.Len(t, pvs, 1)
+
+		pd, err := packages.GetPackageDescriptor(t.Context(), pvs[0])
+		assert.NoError(t, err)
+		metadata, ok := pd.Metadata.(*pypi.Metadata)
+		require.True(t, ok)
+		assert.Empty(t, metadata.ProjectURL)
 	})
 
 	t.Run("Download", func(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
 
 		downloadFile := func(filename string) {
-			req := NewRequest(t, "GET", fmt.Sprintf("%s/files/%s/%s/%s", root, packageName, packageVersion, filename))
-			req = AddBasicAuthHeader(req, user.Name)
+			req := NewRequest(t, "GET", fmt.Sprintf("%s/files/%s/%s/%s", root, packageName, packageVersion, filename)).
+				AddBasicAuth(user.Name)
 			resp := MakeRequest(t, req, http.StatusOK)
 
 			assert.Equal(t, []byte(content), resp.Body.Bytes())
@@ -147,7 +196,7 @@ func TestPackagePyPI(t *testing.T) {
 		downloadFile("test.whl")
 		downloadFile("test.tar.gz")
 
-		pvs, err := packages.GetVersionsByPackageType(db.DefaultContext, user.ID, packages.TypePyPI)
+		pvs, err := packages.GetVersionsByPackageName(t.Context(), user.ID, packages.TypePyPI, packageName)
 		assert.NoError(t, err)
 		assert.Len(t, pvs, 1)
 		assert.Equal(t, int64(2), pvs[0].DownloadCount)
@@ -156,15 +205,15 @@ func TestPackagePyPI(t *testing.T) {
 	t.Run("PackageMetadata", func(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
 
-		req := NewRequest(t, "GET", fmt.Sprintf("%s/simple/%s", root, packageName))
-		req = AddBasicAuthHeader(req, user.Name)
+		req := NewRequest(t, "GET", fmt.Sprintf("%s/simple/%s", root, packageName)).
+			AddBasicAuth(user.Name)
 		resp := MakeRequest(t, req, http.StatusOK)
 
 		htmlDoc := NewHTMLParser(t, resp.Body)
 		nodes := htmlDoc.doc.Find("a").Nodes
 		assert.Len(t, nodes, 2)
 
-		hrefMatcher := regexp.MustCompile(fmt.Sprintf(`%s/files/%s/%s/test\..+#sha256-%s`, root, regexp.QuoteMeta(packageName), regexp.QuoteMeta(packageVersion), hashSHA256))
+		hrefMatcher := regexp.MustCompile(fmt.Sprintf(`%s/files/%s/%s/test\..+#sha256=%s`, root, regexp.QuoteMeta(packageName), regexp.QuoteMeta(packageVersion), hashSHA256))
 
 		for _, a := range nodes {
 			for _, att := range a.Attr {

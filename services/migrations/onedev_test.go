@@ -4,39 +4,88 @@
 package migrations
 
 import (
-	"context"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	base "code.gitea.io/gitea/modules/migration"
+	"gitea.dev/models/unittest"
+	base "gitea.dev/modules/migration"
+	"gitea.dev/modules/util"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func TestOneDevDownloadRepo(t *testing.T) {
-	resp, err := http.Get("https://code.onedev.io/projects/go-gitea-test_repo")
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Skipf("Can't access test repo, skipping %s", t.Name())
+func TestOneDevServerVersion(t *testing.T) {
+	type respMapType map[string]struct {
+		code int
+		body string
 	}
+	var respMap atomic.Pointer[respMapType]
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp, ok := (*respMap.Load())[r.URL.Path]
+		w.WriteHeader(util.Iif(ok, resp.code, http.StatusNotFound))
+		_, _ = io.WriteString(w, resp.body)
+	}))
+	defer server.Close()
 
-	u, _ := url.Parse("https://code.onedev.io")
-	downloader := NewOneDevDownloader(context.Background(), u, "", "", "go-gitea-test_repo")
-	if err != nil {
-		t.Fatalf("NewOneDevDownloader is nil: %v", err)
-	}
-	repo, err := downloader.GetRepoInfo()
+	baseURL, err := url.Parse(server.URL)
+	assert.NoError(t, err)
+	downloader := func() *OneDevDownloader { return &OneDevDownloader{baseURL: baseURL, client: server.Client()} }
+
+	t.Run("LegacyEndpoint", func(t *testing.T) {
+		respMap.Store(&respMapType{"/~api/version/server": {code: http.StatusOK, body: "12.0.1"}})
+		d := downloader()
+		v, err := d.getServerVersion(t.Context())
+		assert.NoError(t, err)
+		assert.Equal(t, "12.0.1", v.String())
+		respMap.Store(&respMapType{}) // remove the legacy endpoint, next call should still succeed by using cached version
+		v, err = d.getServerVersion(t.Context())
+		assert.NoError(t, err)
+		assert.Equal(t, "12.0.1", v.String())
+	})
+
+	t.Run("NewEndpoint", func(t *testing.T) {
+		respMap.Store(&respMapType{"/~api/server/version": {code: http.StatusOK, body: "16.9.7"}})
+		v, err := downloader().getServerVersion(t.Context())
+		assert.NoError(t, err)
+		assert.Equal(t, "16.9.7", v.String())
+	})
+
+	t.Run("NoEndpoint", func(t *testing.T) {
+		respMap.Store(&respMapType{})
+		_, err := downloader().getServerVersion(t.Context())
+		assert.ErrorContains(t, err, "server version request failed")
+	})
+}
+
+func TestOneDevDownloadRepo(t *testing.T) {
+	liveMode := os.Getenv("ONEDEV_LIVE") != ""
+
+	_, callerFile, _, _ := runtime.Caller(0)
+	fixtureDir := filepath.Join(filepath.Dir(callerFile), "_mock_data/TestOneDevDownloadRepo")
+	mockServer := unittest.NewMockWebServer(t, "https://code.onedev.io", fixtureDir, liveMode)
+
+	u, _ := url.Parse(mockServer.URL)
+	ctx := t.Context()
+	downloader := NewOneDevDownloader(ctx, u, "", "", "go-gitea-test_repo")
+	repo, err := downloader.GetRepoInfo(ctx)
 	assert.NoError(t, err)
 	assertRepositoryEqual(t, &base.Repository{
 		Name:        "go-gitea-test_repo",
 		Owner:       "",
 		Description: "Test repository for testing migration from OneDev to gitea",
-		CloneURL:    "https://code.onedev.io/go-gitea-test_repo",
-		OriginalURL: "https://code.onedev.io/projects/go-gitea-test_repo",
+		CloneURL:    mockServer.URL + "/go-gitea-test_repo",
+		OriginalURL: mockServer.URL + "/go-gitea-test_repo",
 	}, repo)
 
-	milestones, err := downloader.GetMilestones()
+	milestones, err := downloader.GetMilestones(ctx)
 	assert.NoError(t, err)
 	deadline := time.Unix(1620086400, 0)
 	assertMilestonesEqual(t, []*base.Milestone{
@@ -44,18 +93,20 @@ func TestOneDevDownloadRepo(t *testing.T) {
 			Title:    "1.0.0",
 			Deadline: &deadline,
 			Closed:   &deadline,
+			State:    "closed",
 		},
 		{
 			Title:       "1.1.0",
 			Description: "next things?",
+			State:       "open",
 		},
 	}, milestones)
 
-	labels, err := downloader.GetLabels()
+	labels, err := downloader.GetLabels(ctx)
 	assert.NoError(t, err)
 	assert.Len(t, labels, 6)
 
-	issues, isEnd, err := downloader.GetIssues(1, 2)
+	issues, isEnd, err := downloader.GetIssues(ctx, 1, 2)
 	assert.NoError(t, err)
 	assert.False(t, isEnd)
 	assertIssuesEqual(t, []*base.Issue{
@@ -94,7 +145,7 @@ func TestOneDevDownloadRepo(t *testing.T) {
 		},
 	}, issues)
 
-	comments, _, err := downloader.GetComments(&base.Issue{
+	comments, _, err := downloader.GetComments(ctx, &base.Issue{
 		Number:       4,
 		ForeignIndex: 398,
 		Context:      onedevIssueContext{IsPullRequest: false},
@@ -103,6 +154,7 @@ func TestOneDevDownloadRepo(t *testing.T) {
 	assertCommentsEqual(t, []*base.Comment{
 		{
 			IssueIndex: 4,
+			PosterID:   336,
 			PosterName: "User 336",
 			Created:    time.Unix(1628549791, 128000000),
 			Updated:    time.Unix(1628549791, 128000000),
@@ -110,13 +162,14 @@ func TestOneDevDownloadRepo(t *testing.T) {
 		},
 	}, comments)
 
-	prs, _, err := downloader.GetPullRequests(1, 1)
+	prs, _, err := downloader.GetPullRequests(ctx, 1, 1)
 	assert.NoError(t, err)
 	assertPullRequestsEqual(t, []*base.PullRequest{
 		{
 			Number:     5,
 			Title:      "Pull to add a new file",
 			Content:    "just do some git stuff",
+			PosterID:   336,
 			PosterName: "User 336",
 			State:      "open",
 			Created:    time.Unix(1628550076, 25000000),
@@ -136,11 +189,12 @@ func TestOneDevDownloadRepo(t *testing.T) {
 		},
 	}, prs)
 
-	rvs, err := downloader.GetReviews(&base.PullRequest{Number: 5, ForeignIndex: 186})
+	rvs, err := downloader.GetReviews(ctx, &base.PullRequest{Number: 5, ForeignIndex: 186})
 	assert.NoError(t, err)
 	assertReviewsEqual(t, []*base.Review{
 		{
 			IssueIndex:   5,
+			ReviewerID:   317,
 			ReviewerName: "User 317",
 			State:        "PENDING",
 		},

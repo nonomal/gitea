@@ -5,35 +5,32 @@ package private
 
 import (
 	"net/http"
+	"slices"
 
-	repo_model "code.gitea.io/gitea/models/repo"
-	gitea_context "code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/private"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/agit"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/private"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/agit"
+	gitea_context "gitea.dev/services/context"
 )
 
 // HookProcReceive proc-receive hook - only handles agit Proc-Receive requests at present
 func HookProcReceive(ctx *gitea_context.PrivateContext) {
-	opts := web.GetForm(ctx).(*private.HookOptions)
-	if !git.SupportProcReceive {
-		ctx.Status(http.StatusNotFound)
+	opts := web.GetForm[*private.HookOptions](ctx)
+	if !loadContextDoerPermission(ctx, opts.UserID, opts.UserExtDoerData) ||
+		(slices.ContainsFunc(opts.RefFullNames, git.RefName.IsFor) && !assertCanCreatePullRequest(ctx, opts)) {
 		return
 	}
 
-	results, err := agit.ProcReceive(ctx, ctx.Repo.Repository, ctx.Repo.GitRepo, opts)
+	results, err := agit.ProcReceive(ctx, ctx.Repo.Repository, ctx.Repo.GitRepo, ctx.Repo.Permission, &agit.ProcReceiveOptions{
+		OldCommitIDs:   opts.OldCommitIDs,
+		NewCommitIDs:   opts.NewCommitIDs,
+		RefFullNames:   opts.RefFullNames,
+		GitPushOptions: opts.GitPushOptions,
+		Doer:           ctx.Doer,
+	})
 	if err != nil {
-		if repo_model.IsErrUserDoesNotHaveAccessToRepo(err) {
-			ctx.Error(http.StatusBadRequest, "UserDoesNotHaveAccessToRepo", err.Error())
-		} else {
-			log.Error(err.Error())
-			ctx.JSON(http.StatusInternalServerError, private.Response{
-				Err: err.Error(),
-			})
-		}
-
+		ctx.PrivateUserErrorAuto(err)
 		return
 	}
 

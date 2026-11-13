@@ -4,7 +4,6 @@
 package integration
 
 import (
-	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"fmt"
@@ -15,12 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/packages"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	pub_module "code.gitea.io/gitea/modules/packages/pub"
-	"code.gitea.io/gitea/tests"
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/packages"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	pub_module "gitea.dev/modules/packages/pub"
+	"gitea.dev/modules/test"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -30,30 +30,23 @@ func TestPackagePub(t *testing.T) {
 
 	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
 
-	token := "Bearer " + getUserToken(t, user.Name)
+	token := "Bearer " + getUserToken(t, user.Name, auth_model.AccessTokenScopeWritePackage)
 
 	packageName := "test_package"
 	packageVersion := "1.0.1"
+	packageVersionLatest := "1.0.2"
 	packageDescription := "Test Description"
 
-	filename := fmt.Sprintf("%s.tar.gz", packageVersion)
+	filename := packageVersion + ".tar.gz"
 
-	pubspecContent := `name: ` + packageName + `
-version: ` + packageVersion + `
-description: ` + packageDescription
-
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	archive := tar.NewWriter(zw)
-	archive.WriteHeader(&tar.Header{
-		Name: "pubspec.yaml",
-		Mode: 0o600,
-		Size: int64(len(pubspecContent)),
-	})
-	archive.Write([]byte(pubspecContent))
-	archive.Close()
-	zw.Close()
-	content := buf.Bytes()
+	buildPackage := func(version string) []byte {
+		return test.WriteTarCompression(gzip.NewWriter, map[string]string{
+			"pubspec.yaml": `name: ` + packageName + `
+version: ` + version + `
+description: ` + packageDescription,
+		}).Bytes()
+	}
+	content := buildPackage(packageVersion)
 
 	root := fmt.Sprintf("/api/packages/%s/pub", user.Name)
 
@@ -65,8 +58,8 @@ description: ` + packageDescription
 		req := NewRequest(t, "GET", uploadURL)
 		MakeRequest(t, req, http.StatusUnauthorized)
 
-		req = NewRequest(t, "GET", uploadURL)
-		addTokenAuthHeader(req, token)
+		req = NewRequest(t, "GET", uploadURL).
+			AddTokenAuth(token)
 		resp := MakeRequest(t, req, http.StatusOK)
 
 		type UploadRequest struct {
@@ -74,8 +67,7 @@ description: ` + packageDescription
 			Fields map[string]string `json:"fields"`
 		}
 
-		var result UploadRequest
-		DecodeJSON(t, resp, &result)
+		result := DecodeJSON(t, resp, &UploadRequest{})
 
 		assert.Empty(t, result.Fields)
 
@@ -87,41 +79,50 @@ description: ` + packageDescription
 
 			_ = writer.Close()
 
-			req := NewRequestWithBody(t, "POST", url, body)
-			req.Header.Add("Content-Type", writer.FormDataContentType())
-			addTokenAuthHeader(req, token)
+			req := NewRequestWithBody(t, "POST", url, body).
+				SetHeader("Content-Type", writer.FormDataContentType()).
+				AddTokenAuth(token)
 			return MakeRequest(t, req, expectedStatus)
 		}
 
 		resp = uploadFile(t, result.URL, content, http.StatusNoContent)
 
-		req = NewRequest(t, "GET", resp.Header().Get("Location"))
-		addTokenAuthHeader(req, token)
+		req = NewRequest(t, "GET", resp.Header().Get("Location")).
+			AddTokenAuth(token)
 		MakeRequest(t, req, http.StatusOK)
 
-		pvs, err := packages.GetVersionsByPackageType(db.DefaultContext, user.ID, packages.TypePub)
+		pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypePub)
 		assert.NoError(t, err)
 		assert.Len(t, pvs, 1)
 
-		pd, err := packages.GetPackageDescriptor(db.DefaultContext, pvs[0])
+		pd, err := packages.GetPackageDescriptor(t.Context(), pvs[0])
 		assert.NoError(t, err)
 		assert.NotNil(t, pd.SemVer)
 		assert.IsType(t, &pub_module.Metadata{}, pd.Metadata)
 		assert.Equal(t, packageName, pd.Package.Name)
 		assert.Equal(t, packageVersion, pd.Version.Version)
 
-		pfs, err := packages.GetFilesByVersionID(db.DefaultContext, pvs[0].ID)
+		pfs, err := packages.GetFilesByVersionID(t.Context(), pvs[0].ID)
 		assert.NoError(t, err)
 		assert.Len(t, pfs, 1)
 		assert.Equal(t, filename, pfs[0].Name)
 		assert.True(t, pfs[0].IsLead)
 
-		pb, err := packages.GetBlobByID(db.DefaultContext, pfs[0].BlobID)
+		pb, err := packages.GetBlobByID(t.Context(), pfs[0].BlobID)
 		assert.NoError(t, err)
 		assert.Equal(t, int64(len(content)), pb.Size)
 
-		_ = uploadFile(t, result.URL, content, http.StatusBadRequest)
+		_ = uploadFile(t, result.URL, content, http.StatusConflict)
+
+		uploadFile(t, result.URL, buildPackage(packageVersionLatest), http.StatusNoContent)
 	})
+
+	type VersionMetadata struct {
+		Version    string    `json:"version"`
+		ArchiveURL string    `json:"archive_url"`
+		Published  time.Time `json:"published"`
+		Pubspec    any       `json:"pubspec,omitempty"`
+	}
 
 	t.Run("Download", func(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
@@ -129,15 +130,7 @@ description: ` + packageDescription
 		req := NewRequest(t, "GET", fmt.Sprintf("%s/api/packages/%s/%s", root, packageName, packageVersion))
 		resp := MakeRequest(t, req, http.StatusOK)
 
-		type VersionMetadata struct {
-			Version    string      `json:"version"`
-			ArchiveURL string      `json:"archive_url"`
-			Published  time.Time   `json:"published"`
-			Pubspec    interface{} `json:"pubspec,omitempty"`
-		}
-
-		var result VersionMetadata
-		DecodeJSON(t, resp, &result)
+		result := DecodeJSON(t, resp, &VersionMetadata{})
 
 		assert.Equal(t, packageVersion, result.Version)
 		assert.NotNil(t, result.Pubspec)
@@ -154,27 +147,20 @@ description: ` + packageDescription
 		req := NewRequest(t, "GET", fmt.Sprintf("%s/api/packages/%s", root, packageName))
 		resp := MakeRequest(t, req, http.StatusOK)
 
-		type VersionMetadata struct {
-			Version    string      `json:"version"`
-			ArchiveURL string      `json:"archive_url"`
-			Published  time.Time   `json:"published"`
-			Pubspec    interface{} `json:"pubspec,omitempty"`
-		}
-
 		type PackageVersions struct {
 			Name     string             `json:"name"`
 			Latest   *VersionMetadata   `json:"latest"`
 			Versions []*VersionMetadata `json:"versions"`
 		}
 
-		var result PackageVersions
-		DecodeJSON(t, resp, &result)
+		result := DecodeJSON(t, resp, &PackageVersions{})
 
 		assert.Equal(t, packageName, result.Name)
 		assert.NotNil(t, result.Latest)
-		assert.Len(t, result.Versions, 1)
-		assert.Equal(t, result.Latest.Version, result.Versions[0].Version)
-		assert.Equal(t, packageVersion, result.Latest.Version)
+		assert.Len(t, result.Versions, 2)
+		assert.Equal(t, packageVersion, result.Versions[0].Version)
+		assert.Equal(t, packageVersionLatest, result.Versions[1].Version)
+		assert.Equal(t, packageVersionLatest, result.Latest.Version)
 		assert.NotNil(t, result.Latest.Pubspec)
 	})
 }

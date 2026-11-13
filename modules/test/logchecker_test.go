@@ -7,14 +7,12 @@ import (
 	"testing"
 	"time"
 
-	"code.gitea.io/gitea/modules/log"
+	"gitea.dev/modules/log"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestLogChecker(t *testing.T) {
-	_ = log.NewLogger(1000, "console", "console", `{"level":"info","stacktracelevel":"NONE","stderr":true}`)
-
 	lc, cleanup := NewLogChecker(log.DEFAULT)
 	defer cleanup()
 

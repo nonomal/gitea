@@ -8,37 +8,45 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
-	packages_model "code.gitea.io/gitea/models/packages"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/log"
-	packages_module "code.gitea.io/gitea/modules/packages"
-	swift_module "code.gitea.io/gitea/modules/packages/swift"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/routers/api/packages/helper"
-	packages_service "code.gitea.io/gitea/services/packages"
+	packages_model "gitea.dev/models/packages"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	packages_module "gitea.dev/modules/packages"
+	swift_module "gitea.dev/modules/packages/swift"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
+	"gitea.dev/routers/api/packages/helper"
+	"gitea.dev/services/context"
+	packages_service "gitea.dev/services/packages"
 
 	"github.com/hashicorp/go-version"
 )
 
-// https://github.com/apple/swift-package-manager/blob/main/Documentation/Registry.md#35-api-versioning
+// https://github.com/swiftlang/swift-package-manager/blob/main/Documentation/PackageRegistry/Registry.md#35-api-versioning
 const (
 	AcceptJSON  = "application/vnd.swift.registry.v1+json"
 	AcceptSwift = "application/vnd.swift.registry.v1+swift"
 	AcceptZip   = "application/vnd.swift.registry.v1+zip"
 )
 
-var (
-	// https://github.com/apple/swift-package-manager/blob/main/Documentation/Registry.md#361-package-scope
-	scopePattern = regexp.MustCompile(`\A[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\z`)
-	// https://github.com/apple/swift-package-manager/blob/main/Documentation/Registry.md#362-package-name
-	namePattern = regexp.MustCompile(`\A[a-zA-Z0-9][a-zA-Z0-9-_]{0,99}\z`)
-)
+var globalVars = sync.OnceValue(func() (ret struct {
+	scopePattern *regexp.Regexp
+	namePattern  *regexp.Regexp
+},
+) {
+	// https://github.com/swiftlang/swift-package-manager/blob/main/Documentation/PackageRegistry/Registry.md#361-package-scope
+	ret.scopePattern = regexp.MustCompile(`\A[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\z`)
+	// https://github.com/swiftlang/swift-package-manager/blob/main/Documentation/PackageRegistry/Registry.md#362-package-name
+	ret.namePattern = regexp.MustCompile(`\A[a-zA-Z0-9][a-zA-Z0-9-_]{0,99}\z`)
+	return ret
+})
 
 type headers struct {
 	Status      int
@@ -48,7 +56,7 @@ type headers struct {
 	Link        string
 }
 
-// https://github.com/apple/swift-package-manager/blob/main/Documentation/Registry.md#35-api-versioning
+// https://github.com/swiftlang/swift-package-manager/blob/main/Documentation/PackageRegistry/Registry.md#35-api-versioning
 func setResponseHeaders(resp http.ResponseWriter, h *headers) {
 	if h.ContentType != "" {
 		resp.Header().Set("Content-Type", h.ContentType)
@@ -68,29 +76,26 @@ func setResponseHeaders(resp http.ResponseWriter, h *headers) {
 	}
 }
 
-// https://github.com/apple/swift-package-manager/blob/main/Documentation/Registry.md#33-error-handling
-func apiError(ctx *context.Context, status int, obj interface{}) {
+// https://github.com/swiftlang/swift-package-manager/blob/main/Documentation/PackageRegistry/Registry.md#33-error-handling
+func apiError(ctx *context.Context, status int, obj any) {
 	// https://www.rfc-editor.org/rfc/rfc7807
 	type Problem struct {
 		Status int    `json:"status"`
 		Detail string `json:"detail"`
 	}
 
-	helper.LogAndProcessError(ctx, status, obj, func(message string) {
-		setResponseHeaders(ctx.Resp, &headers{
-			Status:      status,
-			ContentType: "application/problem+json",
-		})
-		if err := json.NewEncoder(ctx.Resp).Encode(Problem{
-			Status: status,
-			Detail: message,
-		}); err != nil {
-			log.Error("JSON encode: %v", err)
-		}
+	message := helper.ProcessErrorForUser(ctx, status, obj)
+	setResponseHeaders(ctx.Resp, &headers{
+		Status:      status,
+		ContentType: "application/problem+json",
+	})
+	_ = json.NewEncoder(ctx.Resp).Encode(Problem{
+		Status: status,
+		Detail: message,
 	})
 }
 
-// https://github.com/apple/swift-package-manager/blob/main/Documentation/Registry.md#35-api-versioning
+// https://github.com/swiftlang/swift-package-manager/blob/main/Documentation/PackageRegistry/Registry.md#35-api-versioning
 func CheckAcceptMediaType(requiredAcceptHeader string) func(ctx *context.Context) {
 	return func(ctx *context.Context) {
 		accept := ctx.Req.Header.Get("Accept")
@@ -98,6 +103,16 @@ func CheckAcceptMediaType(requiredAcceptHeader string) func(ctx *context.Context
 			apiError(ctx, http.StatusBadRequest, fmt.Sprintf("Unexpected accept header. Should be '%s'.", requiredAcceptHeader))
 		}
 	}
+}
+
+// https://github.com/swiftlang/swift-package-manager/blob/main/Documentation/PackageRegistry/PackageRegistryUsage.md#registry-authentication
+func CheckAuthenticate(ctx *context.Context) {
+	if ctx.Doer == nil {
+		apiError(ctx, http.StatusUnauthorized, nil)
+		return
+	}
+
+	ctx.Status(http.StatusOK)
 }
 
 func buildPackageID(scope, name string) string {
@@ -112,10 +127,10 @@ type EnumeratePackageVersionsResponse struct {
 	Releases map[string]Release `json:"releases"`
 }
 
-// https://github.com/apple/swift-package-manager/blob/main/Documentation/Registry.md#41-list-package-releases
+// https://github.com/swiftlang/swift-package-manager/blob/main/Documentation/PackageRegistry/Registry.md#41-list-package-releases
 func EnumeratePackageVersions(ctx *context.Context) {
-	packageScope := ctx.Params("scope")
-	packageName := ctx.Params("name")
+	packageScope := ctx.PathParam("scope")
+	packageName := ctx.PathParam("name")
 
 	pvs, err := packages_model.GetVersionsByPackageName(ctx, ctx.Package.Owner.ID, packages_model.TypeSwift, buildPackageID(packageScope, packageName))
 	if err != nil {
@@ -137,7 +152,7 @@ func EnumeratePackageVersions(ctx *context.Context) {
 		return pds[i].SemVer.LessThan(pds[j].SemVer)
 	})
 
-	baseURL := fmt.Sprintf("%sapi/packages/%s/swift/%s/%s/", setting.AppURL, ctx.Package.Owner.LowerName, packageScope, packageName)
+	baseURL := fmt.Sprintf("%sapi/packages/%s/swift/%s/%s/", setting.AppURL, url.PathEscape(ctx.Package.Owner.LowerName), url.PathEscape(packageScope), url.PathEscape(packageName))
 
 	releases := make(map[string]Release)
 	for _, pd := range pds {
@@ -148,7 +163,7 @@ func EnumeratePackageVersions(ctx *context.Context) {
 	}
 
 	setResponseHeaders(ctx.Resp, &headers{
-		Link: fmt.Sprintf(`<%s%s>; rel="latest-version"`, baseURL, pds[len(pds)-1].Version.Version),
+		Link: fmt.Sprintf(`<%s%s>; rel="latest-version"`, baseURL, url.PathEscape(pds[len(pds)-1].Version.Version)),
 	})
 
 	ctx.JSON(http.StatusOK, EnumeratePackageVersionsResponse{
@@ -157,7 +172,7 @@ func EnumeratePackageVersions(ctx *context.Context) {
 }
 
 type Resource struct {
-	Name     string `json:"id"`
+	Name     string `json:"name"`
 	Type     string `json:"type"`
 	Checksum string `json:"checksum"`
 }
@@ -169,11 +184,11 @@ type PackageVersionMetadataResponse struct {
 	Metadata  *swift_module.SoftwareSourceCode `json:"metadata"`
 }
 
-// https://github.com/apple/swift-package-manager/blob/main/Documentation/Registry.md#endpoint-2
+// https://github.com/swiftlang/swift-package-manager/blob/main/Documentation/PackageRegistry/Registry.md#endpoint-2
 func PackageVersionMetadata(ctx *context.Context) {
-	id := buildPackageID(ctx.Params("scope"), ctx.Params("name"))
+	id := buildPackageID(ctx.PathParam("scope"), ctx.PathParam("name"))
 
-	pv, err := packages_model.GetVersionByNameAndVersion(ctx, ctx.Package.Owner.ID, packages_model.TypeSwift, id, ctx.Params("version"))
+	pv, err := packages_model.GetVersionByNameAndVersion(ctx, ctx.Package.Owner.ID, packages_model.TypeSwift, id, ctx.PathParam("version"))
 	if err != nil {
 		if errors.Is(err, util.ErrNotExist) {
 			apiError(ctx, http.StatusNotFound, err)
@@ -189,7 +204,24 @@ func PackageVersionMetadata(ctx *context.Context) {
 		return
 	}
 
-	metadata := pd.Metadata.(*swift_module.Metadata)
+	metadata := packages_model.DescriptorMetadata[*swift_module.Metadata](pd)
+	repositoryURLs := make([]string, 0, len(pd.VersionProperties))
+	for _, property := range pd.VersionProperties {
+		if property.Name == swift_module.PropertyRepositoryURL {
+			repositoryURLs = append(repositoryURLs, property.Value)
+		}
+	}
+
+	var author *swift_module.Person
+	if metadata.Author.Name != "" || metadata.Author.GivenName != "" || metadata.Author.MiddleName != "" || metadata.Author.FamilyName != "" {
+		author = &swift_module.Person{
+			Type:       "Person",
+			Name:       metadata.Author.Name,
+			GivenName:  metadata.Author.GivenName,
+			MiddleName: metadata.Author.MiddleName,
+			FamilyName: metadata.Author.FamilyName,
+		}
+	}
 
 	setResponseHeaders(ctx.Resp, &headers{})
 
@@ -212,26 +244,23 @@ func PackageVersionMetadata(ctx *context.Context) {
 			Keywords:       metadata.Keywords,
 			CodeRepository: metadata.RepositoryURL,
 			License:        metadata.License,
+			LicenseURL:     metadata.LicenseURL,
+			Author:         author,
 			ProgrammingLanguage: swift_module.ProgrammingLanguage{
 				Type: "ComputerLanguage",
 				Name: "Swift",
 				URL:  "https://swift.org",
 			},
-			Author: swift_module.Person{
-				Type:       "Person",
-				GivenName:  metadata.Author.GivenName,
-				MiddleName: metadata.Author.MiddleName,
-				FamilyName: metadata.Author.FamilyName,
-			},
+			RepositoryURLs: repositoryURLs,
 		},
 	})
 }
 
-// https://github.com/apple/swift-package-manager/blob/main/Documentation/Registry.md#43-fetch-manifest-for-a-package-release
+// https://github.com/swiftlang/swift-package-manager/blob/main/Documentation/PackageRegistry/Registry.md#43-fetch-manifest-for-a-package-release
 func DownloadManifest(ctx *context.Context) {
-	packageScope := ctx.Params("scope")
-	packageName := ctx.Params("name")
-	packageVersion := ctx.Params("version")
+	packageScope := ctx.PathParam("scope")
+	packageName := ctx.PathParam("name")
+	packageVersion := ctx.PathParam("version")
 
 	pv, err := packages_model.GetVersionByNameAndVersion(ctx, ctx.Package.Owner.ID, packages_model.TypeSwift, buildPackageID(packageScope, packageName), packageVersion)
 	if err != nil {
@@ -256,7 +285,7 @@ func DownloadManifest(ctx *context.Context) {
 			swiftVersion = swift_module.TrimmedVersionString(v)
 		}
 	}
-	m, ok := pd.Metadata.(*swift_module.Metadata).Manifests[swiftVersion]
+	m, ok := packages_model.DescriptorMetadata[*swift_module.Metadata](pd).Manifests[swiftVersion]
 	if !ok {
 		setResponseHeaders(ctx.Resp, &headers{
 			Status:   http.StatusSeeOther,
@@ -272,45 +301,64 @@ func DownloadManifest(ctx *context.Context) {
 		filename = fmt.Sprintf("Package@swift-%s.swift", swiftVersion)
 	}
 
-	ctx.ServeContent(strings.NewReader(m.Content), &context.ServeHeaderOptions{
+	ctx.ServeContent(strings.NewReader(m.Content), context.ServeHeaderOptions{
 		ContentType:  "text/x-swift",
 		Filename:     filename,
 		LastModified: pv.CreatedUnix.AsLocalTime(),
 	})
 }
 
-// https://github.com/apple/swift-package-manager/blob/main/Documentation/Registry.md#endpoint-6
+// formFileOptionalReadCloser returns (nil, nil) if the formKey is not present.
+func formFileOptionalReadCloser(ctx *context.Context, formKey string) (io.ReadCloser, error) {
+	multipartFile, _, err := ctx.Req.FormFile(formKey)
+	if err != nil && !errors.Is(err, http.ErrMissingFile) {
+		return nil, err
+	}
+	if multipartFile != nil {
+		return multipartFile, nil
+	}
+
+	content := ctx.Req.FormValue(formKey)
+	if content == "" {
+		return nil, nil //nolint:nilnil // return nil to indicate that the content does not exist
+	}
+	return io.NopCloser(strings.NewReader(content)), nil
+}
+
+// UploadPackageFile refers to https://github.com/swiftlang/swift-package-manager/blob/main/Documentation/PackageRegistry/Registry.md#endpoint-6
 func UploadPackageFile(ctx *context.Context) {
-	packageScope := ctx.Params("scope")
-	packageName := ctx.Params("name")
+	packageScope := ctx.PathParam("scope")
+	packageName := ctx.PathParam("name")
+	packageVersion := ctx.PathParam("version")
 
-	v, err := version.NewVersion(ctx.Params("version"))
+	_, err := version.NewSemver(packageVersion)
 
-	if !scopePattern.MatchString(packageScope) || !namePattern.MatchString(packageName) || err != nil {
+	if err != nil || !globalVars().scopePattern.MatchString(packageScope) || !globalVars().namePattern.MatchString(packageName) {
 		apiError(ctx, http.StatusBadRequest, err)
 		return
 	}
 
-	packageVersion := v.Core().String()
-
-	file, _, err := ctx.Req.FormFile("source-archive")
-	if err != nil {
-		apiError(ctx, http.StatusBadRequest, err)
+	file, err := formFileOptionalReadCloser(ctx, "source-archive")
+	if file == nil || err != nil {
+		apiError(ctx, http.StatusBadRequest, "unable to read source-archive file")
 		return
 	}
 	defer file.Close()
 
-	buf, err := packages_module.CreateHashedBufferFromReader(file, 32*1024*1024)
+	buf, err := packages_module.CreateHashedBufferFromReader(file)
 	if err != nil {
 		apiError(ctx, http.StatusInternalServerError, err)
 		return
 	}
 	defer buf.Close()
 
-	var mr io.Reader
-	metadata := ctx.Req.FormValue("metadata")
-	if metadata != "" {
-		mr = strings.NewReader(metadata)
+	mr, err := formFileOptionalReadCloser(ctx, "metadata")
+	if err != nil {
+		apiError(ctx, http.StatusBadRequest, "unable to read metadata file")
+		return
+	}
+	if mr != nil {
+		defer mr.Close()
 	}
 
 	pck, err := swift_module.ParsePackage(buf, buf.Size(), mr)
@@ -329,6 +377,7 @@ func UploadPackageFile(ctx *context.Context) {
 	}
 
 	pv, _, err := packages_service.CreatePackageAndAddFile(
+		ctx,
 		&packages_service.PackageCreationInfo{
 			PackageInfo: packages_service.PackageInfo{
 				Owner:       ctx.Package.Owner,
@@ -377,9 +426,9 @@ func UploadPackageFile(ctx *context.Context) {
 	ctx.Status(http.StatusCreated)
 }
 
-// https://github.com/apple/swift-package-manager/blob/main/Documentation/Registry.md#endpoint-4
+// https://github.com/swiftlang/swift-package-manager/blob/main/Documentation/PackageRegistry/Registry.md#endpoint-4
 func DownloadPackageFile(ctx *context.Context) {
-	pv, err := packages_model.GetVersionByNameAndVersion(ctx, ctx.Package.Owner.ID, packages_model.TypeSwift, buildPackageID(ctx.Params("scope"), ctx.Params("name")), ctx.Params("version"))
+	pv, err := packages_model.GetVersionByNameAndVersion(ctx, ctx.Package.Owner.ID, packages_model.TypeSwift, buildPackageID(ctx.PathParam("scope"), ctx.PathParam("name")), ctx.PathParam("version"))
 	if err != nil {
 		if errors.Is(err, util.ErrNotExist) {
 			apiError(ctx, http.StatusNotFound, err)
@@ -397,18 +446,17 @@ func DownloadPackageFile(ctx *context.Context) {
 
 	pf := pd.Files[0].File
 
-	s, _, err := packages_service.GetPackageFileStream(ctx, pf)
+	s, u, _, err := packages_service.OpenFileForDownload(ctx, pf, ctx.Req.Method)
 	if err != nil {
 		apiError(ctx, http.StatusInternalServerError, err)
 		return
 	}
-	defer s.Close()
 
 	setResponseHeaders(ctx.Resp, &headers{
 		Digest: pd.Files[0].Blob.HashSHA256,
 	})
 
-	ctx.ServeContent(s, &context.ServeHeaderOptions{
+	helper.ServePackageFile(ctx, s, u, pf, context.ServeHeaderOptions{
 		Filename:     pf.Name,
 		ContentType:  "application/zip",
 		LastModified: pf.CreatedUnix.AsLocalTime(),
@@ -419,7 +467,7 @@ type LookupPackageIdentifiersResponse struct {
 	Identifiers []string `json:"identifiers"`
 }
 
-// https://github.com/apple/swift-package-manager/blob/main/Documentation/Registry.md#endpoint-5
+// https://github.com/swiftlang/swift-package-manager/blob/main/Documentation/PackageRegistry/Registry.md#endpoint-5
 func LookupPackageIdentifiers(ctx *context.Context) {
 	url := ctx.FormTrim("url")
 	if url == "" {
@@ -433,7 +481,7 @@ func LookupPackageIdentifiers(ctx *context.Context) {
 		Properties: map[string]string{
 			swift_module.PropertyRepositoryURL: url,
 		},
-		IsInternal: util.OptionalBoolFalse,
+		IsInternal: optional.Some(false),
 	})
 	if err != nil {
 		apiError(ctx, http.StatusInternalServerError, err)

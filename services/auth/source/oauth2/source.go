@@ -4,12 +4,14 @@
 package oauth2
 
 import (
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/modules/json"
+	"gitea.dev/models/auth"
+	"gitea.dev/modules/json"
 )
 
 // Source holds configuration for the OAuth2 login source.
 type Source struct {
+	auth.ConfigBase `json:"-"`
+
 	Provider                      string
 	ClientID                      string
 	ClientSecret                  string
@@ -25,25 +27,19 @@ type Source struct {
 	GroupTeamMap        string
 	GroupTeamMapRemoval bool
 	RestrictedGroup     string
-	SkipLocalTwoFA      bool `json:",omitempty"`
 
-	// reference to the authSource
-	authSource *auth.Source
+	SSHPublicKeyClaimName string
+	FullNameClaimName     string
+	ExternalIDClaim       string
 }
 
-// FromDB fills up an OAuth2Config from serialized format.
 func (source *Source) FromDB(bs []byte) error {
-	return json.UnmarshalHandleDoubleEncode(bs, &source)
+	auth.UnmarshalAuthSourceConfig(bs, source)
+	return nil
 }
 
-// ToDB exports an SMTPConfig to a serialized format.
 func (source *Source) ToDB() ([]byte, error) {
 	return json.Marshal(source)
-}
-
-// SetAuthSource sets the related AuthSource
-func (source *Source) SetAuthSource(authSource *auth.Source) {
-	source.authSource = authSource
 }
 
 func init() {

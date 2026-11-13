@@ -7,18 +7,17 @@ import (
 	"context"
 	"testing"
 
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/services/auth/source/ldap"
+	"gitea.dev/models/auth"
+	"gitea.dev/modules/test"
+	"gitea.dev/services/auth/source/ldap"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v3"
 )
 
 func TestAddLdapBindDn(t *testing.T) {
 	// Mock cli functions to do not exit on error
-	osExiter := cli.OsExiter
-	defer func() { cli.OsExiter = osExiter }()
-	cli.OsExiter = func(code int) {}
+	defer test.MockVariableValue(&cli.OsExiter, func(code int) {})()
 
 	// Test cases
 	cases := []struct {
@@ -51,6 +50,13 @@ func TestAddLdapBindDn(t *testing.T) {
 				"--attributes-in-bind",
 				"--synchronize-users",
 				"--page-size", "99",
+				"--enable-groups",
+				"--group-search-base-dn", "ou=group,dc=full-domain-bind,dc=org",
+				"--group-member-attribute", "memberUid",
+				"--group-user-attribute", "uid",
+				"--group-filter", "(|(cn=gitea_users)(cn=admins))",
+				"--group-team-map", `{"cn=my-group,cn=groups,dc=example,dc=org": {"MyGiteaOrganization": ["MyGiteaTeam1", "MyGiteaTeam2"]}}`,
+				"--group-team-map-removal",
 			},
 			source: &auth.Source{
 				Type:          auth.LDAP,
@@ -78,6 +84,13 @@ func TestAddLdapBindDn(t *testing.T) {
 					AdminFilter:           "(memberOf=cn=admin-group,ou=example,dc=full-domain-bind,dc=org)",
 					RestrictedFilter:      "(memberOf=cn=restricted-group,ou=example,dc=full-domain-bind,dc=org)",
 					Enabled:               true,
+					GroupsEnabled:         true,
+					GroupDN:               "ou=group,dc=full-domain-bind,dc=org",
+					GroupMemberUID:        "memberUid",
+					UserUID:               "uid",
+					GroupFilter:           "(|(cn=gitea_users)(cn=admins))",
+					GroupTeamMap:          `{"cn=my-group,cn=groups,dc=example,dc=org": {"MyGiteaOrganization": ["MyGiteaTeam1", "MyGiteaTeam2"]}}`,
+					GroupTeamMapRemoval:   true,
 				},
 			},
 		},
@@ -121,7 +134,7 @@ func TestAddLdapBindDn(t *testing.T) {
 				"--user-filter", "(memberOf=cn=user-group,ou=example,dc=domain,dc=org)",
 				"--email-attribute", "mail",
 			},
-			errMsg: "Unknown security protocol name: zzzzz",
+			errMsg: "unknown security protocol name: zzzzz",
 		},
 		// case 3
 		{
@@ -210,27 +223,28 @@ func TestAddLdapBindDn(t *testing.T) {
 			initDB: func(context.Context) error {
 				return nil
 			},
-			createAuthSource: func(authSource *auth.Source) error {
+			createAuthSource: func(ctx context.Context, authSource *auth.Source) error {
 				createdAuthSource = authSource
 				return nil
 			},
-			updateAuthSource: func(authSource *auth.Source) error {
-				assert.FailNow(t, "case %d: should not call updateAuthSource", n)
+			updateAuthSource: func(ctx context.Context, authSource *auth.Source) error {
+				assert.FailNow(t, "updateAuthSource called", "case %d: should not call updateAuthSource", n)
 				return nil
 			},
-			getAuthSourceByID: func(id int64) (*auth.Source, error) {
-				assert.FailNow(t, "case %d: should not call getAuthSourceByID", n)
-				return nil, nil
+			getAuthSourceByID: func(ctx context.Context, id int64) (*auth.Source, error) {
+				assert.FailNow(t, "getAuthSourceByID called", "case %d: should not call getAuthSourceByID", n)
+				return nil, nil //nolint:nilnil // mock function covering improper behavior
 			},
 		}
 
 		// Create a copy of command to test
-		app := cli.NewApp()
-		app.Flags = cmdAuthAddLdapBindDn.Flags
-		app.Action = service.addLdapBindDn
+		app := cli.Command{
+			Flags:  microcmdAuthAddLdapBindDn().Flags,
+			Action: service.addLdapBindDn,
+		}
 
 		// Run it
-		err := app.Run(c.args)
+		err := app.Run(t.Context(), c.args)
 		if c.errMsg != "" {
 			assert.EqualError(t, err, c.errMsg, "case %d: error should match", n)
 		} else {
@@ -242,9 +256,7 @@ func TestAddLdapBindDn(t *testing.T) {
 
 func TestAddLdapSimpleAuth(t *testing.T) {
 	// Mock cli functions to do not exit on error
-	osExiter := cli.OsExiter
-	defer func() { cli.OsExiter = osExiter }()
-	cli.OsExiter = func(code int) {}
+	defer test.MockVariableValue(&cli.OsExiter, func(code int) {})()
 
 	// Test cases
 	cases := []struct {
@@ -334,12 +346,12 @@ func TestAddLdapSimpleAuth(t *testing.T) {
 				"--name", "ldap (simple auth) source",
 				"--security-protocol", "zzzzz",
 				"--host", "ldap-server",
-				"--port", "123",
+				"--port", "1234",
 				"--user-filter", "(&(objectClass=posixAccount)(cn=%s))",
 				"--email-attribute", "mail",
 				"--user-dn", "cn=%s,ou=Users,dc=domain,dc=org",
 			},
-			errMsg: "Unknown security protocol name: zzzzz",
+			errMsg: "unknown security protocol name: zzzzz",
 		},
 		// case 3
 		{
@@ -441,27 +453,28 @@ func TestAddLdapSimpleAuth(t *testing.T) {
 			initDB: func(context.Context) error {
 				return nil
 			},
-			createAuthSource: func(authSource *auth.Source) error {
+			createAuthSource: func(ctx context.Context, authSource *auth.Source) error {
 				createdAuthSource = authSource
 				return nil
 			},
-			updateAuthSource: func(authSource *auth.Source) error {
-				assert.FailNow(t, "case %d: should not call updateAuthSource", n)
+			updateAuthSource: func(ctx context.Context, authSource *auth.Source) error {
+				assert.FailNow(t, "updateAuthSource called", "case %d: should not call updateAuthSource", n)
 				return nil
 			},
-			getAuthSourceByID: func(id int64) (*auth.Source, error) {
-				assert.FailNow(t, "case %d: should not call getAuthSourceByID", n)
-				return nil, nil
+			getAuthSourceByID: func(ctx context.Context, id int64) (*auth.Source, error) {
+				assert.FailNow(t, "getAuthSourceById called", "case %d: should not call getAuthSourceByID", n)
+				return nil, nil //nolint:nilnil // mock function covering improper behavior
 			},
 		}
 
 		// Create a copy of command to test
-		app := cli.NewApp()
-		app.Flags = cmdAuthAddLdapSimpleAuth.Flags
-		app.Action = service.addLdapSimpleAuth
+		app := &cli.Command{
+			Flags:  microcmdAuthAddLdapSimpleAuth().Flags,
+			Action: service.addLdapSimpleAuth,
+		}
 
 		// Run it
-		err := app.Run(c.args)
+		err := app.Run(t.Context(), c.args)
 		if c.errMsg != "" {
 			assert.EqualError(t, err, c.errMsg, "case %d: error should match", n)
 		} else {
@@ -473,18 +486,23 @@ func TestAddLdapSimpleAuth(t *testing.T) {
 
 func TestUpdateLdapBindDn(t *testing.T) {
 	// Mock cli functions to do not exit on error
-	osExiter := cli.OsExiter
-	defer func() { cli.OsExiter = osExiter }()
-	cli.OsExiter = func(code int) {}
+	defer test.MockVariableValue(&cli.OsExiter, func(code int) {})()
 
 	// Test cases
-	cases := []struct {
+	type testCase struct {
 		args               []string
 		id                 int64
 		existingAuthSource *auth.Source
 		authSource         *auth.Source
 		errMsg             string
-	}{
+	}
+	withConfig := func(config *ldap.Source, args ...string) testCase {
+		return testCase{
+			args:       append([]string{"ldap-test", "--id", "1"}, args...),
+			authSource: &auth.Source{Type: auth.LDAP, Cfg: config},
+		}
+	}
+	cases := []testCase{
 		// case 0
 		{
 			args: []string{
@@ -510,6 +528,13 @@ func TestUpdateLdapBindDn(t *testing.T) {
 				"--bind-password", "secret-bind-full",
 				"--synchronize-users",
 				"--page-size", "99",
+				"--enable-groups",
+				"--group-search-base-dn", "ou=group,dc=full-domain-bind,dc=org",
+				"--group-member-attribute", "memberUid",
+				"--group-user-attribute", "uid",
+				"--group-filter", "(|(cn=gitea_users)(cn=admins))",
+				"--group-team-map", `{"cn=my-group,cn=groups,dc=example,dc=org": {"MyGiteaOrganization": ["MyGiteaTeam1", "MyGiteaTeam2"]}}`,
+				"--group-team-map-removal",
 			},
 			id: 23,
 			existingAuthSource: &auth.Source{
@@ -545,20 +570,18 @@ func TestUpdateLdapBindDn(t *testing.T) {
 					AdminFilter:           "(memberOf=cn=admin-group,ou=example,dc=full-domain-bind,dc=org)",
 					RestrictedFilter:      "(memberOf=cn=restricted-group,ou=example,dc=full-domain-bind,dc=org)",
 					Enabled:               true,
+					GroupsEnabled:         true,
+					GroupDN:               "ou=group,dc=full-domain-bind,dc=org",
+					GroupMemberUID:        "memberUid",
+					UserUID:               "uid",
+					GroupFilter:           "(|(cn=gitea_users)(cn=admins))",
+					GroupTeamMap:          `{"cn=my-group,cn=groups,dc=example,dc=org": {"MyGiteaOrganization": ["MyGiteaTeam1", "MyGiteaTeam2"]}}`,
+					GroupTeamMapRemoval:   true,
 				},
 			},
 		},
 		// case 1
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg:  &ldap.Source{},
-			},
-		},
+		withConfig(&ldap.Source{}),
 		// case 2
 		{
 			args: []string{
@@ -593,215 +616,44 @@ func TestUpdateLdapBindDn(t *testing.T) {
 			},
 		},
 		// case 4
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--security-protocol", "LDAPS",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					SecurityProtocol: ldap.SecurityProtocol(1),
-				},
-			},
-		},
+		withConfig(&ldap.Source{SecurityProtocol: ldap.SecurityProtocol(1)}, "--security-protocol", "LDAPS"),
 		// case 5
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--skip-tls-verify",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					SkipVerify: true,
-				},
-			},
-		},
+		withConfig(&ldap.Source{SkipVerify: true}, "--skip-tls-verify"),
 		// case 6
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--host", "ldap-server",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					Host: "ldap-server",
-				},
-			},
-		},
+		withConfig(&ldap.Source{Host: "ldap-server"}, "--host", "ldap-server"),
 		// case 7
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--port", "389",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					Port: 389,
-				},
-			},
-		},
+		withConfig(&ldap.Source{Port: 389}, "--port", "389"),
 		// case 8
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--user-search-base", "ou=Users,dc=domain,dc=org",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					UserBase: "ou=Users,dc=domain,dc=org",
-				},
-			},
-		},
+		withConfig(
+			&ldap.Source{UserBase: "ou=Users,dc=domain,dc=org"},
+			"--user-search-base", "ou=Users,dc=domain,dc=org",
+		),
 		// case 9
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--user-filter", "(memberOf=cn=user-group,ou=example,dc=domain,dc=org)",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					Filter: "(memberOf=cn=user-group,ou=example,dc=domain,dc=org)",
-				},
-			},
-		},
+		withConfig(
+			&ldap.Source{Filter: "(memberOf=cn=user-group,ou=example,dc=domain,dc=org)"},
+			"--user-filter", "(memberOf=cn=user-group,ou=example,dc=domain,dc=org)",
+		),
 		// case 10
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--admin-filter", "(memberOf=cn=admin-group,ou=example,dc=domain,dc=org)",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					AdminFilter: "(memberOf=cn=admin-group,ou=example,dc=domain,dc=org)",
-				},
-			},
-		},
+		withConfig(
+			&ldap.Source{AdminFilter: "(memberOf=cn=admin-group,ou=example,dc=domain,dc=org)"},
+			"--admin-filter", "(memberOf=cn=admin-group,ou=example,dc=domain,dc=org)",
+		),
 		// case 11
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--username-attribute", "uid",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					AttributeUsername: "uid",
-				},
-			},
-		},
+		withConfig(&ldap.Source{AttributeUsername: "uid"}, "--username-attribute", "uid"),
 		// case 12
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--firstname-attribute", "givenName",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					AttributeName: "givenName",
-				},
-			},
-		},
+		withConfig(&ldap.Source{AttributeName: "givenName"}, "--firstname-attribute", "givenName"),
 		// case 13
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--surname-attribute", "sn",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					AttributeSurname: "sn",
-				},
-			},
-		},
+		withConfig(&ldap.Source{AttributeSurname: "sn"}, "--surname-attribute", "sn"),
 		// case 14
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--email-attribute", "mail",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					AttributeMail: "mail",
-				},
-			},
-		},
+		withConfig(&ldap.Source{AttributeMail: "mail"}, "--email-attribute", "mail"),
 		// case 15
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--attributes-in-bind",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					AttributesInBind: true,
-				},
-			},
-		},
+		withConfig(&ldap.Source{AttributesInBind: true}, "--attributes-in-bind"),
 		// case 16
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--public-ssh-key-attribute", "publickey",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					AttributeSSHPublicKey: "publickey",
-				},
-			},
-		},
+		withConfig(&ldap.Source{AttributeSSHPublicKey: "publickey"}, "--public-ssh-key-attribute", "publickey"),
 		// case 17
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--bind-dn", "cn=readonly,dc=domain,dc=org",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					BindDN: "cn=readonly,dc=domain,dc=org",
-				},
-			},
-		},
+		withConfig(&ldap.Source{BindDN: "cn=readonly,dc=domain,dc=org"}, "--bind-dn", "cn=readonly,dc=domain,dc=org"),
 		// case 18
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--bind-password", "secret",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					BindPassword: "secret",
-				},
-			},
-		},
+		withConfig(&ldap.Source{BindPassword: "secret"}, "--bind-password", "secret"),
 		// case 19
 		{
 			args: []string{
@@ -816,19 +668,7 @@ func TestUpdateLdapBindDn(t *testing.T) {
 			},
 		},
 		// case 20
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--page-size", "12",
-			},
-			authSource: &auth.Source{
-				Type: auth.LDAP,
-				Cfg: &ldap.Source{
-					SearchPageSize: 12,
-				},
-			},
-		},
+		withConfig(&ldap.Source{SearchPageSize: 12}, "--page-size", "12"),
 		// case 21
 		{
 			args: []string{
@@ -836,7 +676,7 @@ func TestUpdateLdapBindDn(t *testing.T) {
 				"--id", "1",
 				"--security-protocol", "xxxxx",
 			},
-			errMsg: "Unknown security protocol name: xxxxx",
+			errMsg: "unknown security protocol name: xxxxx",
 		},
 		// case 22
 		{
@@ -855,7 +695,7 @@ func TestUpdateLdapBindDn(t *testing.T) {
 				Type: auth.OAuth2,
 				Cfg:  &ldap.Source{},
 			},
-			errMsg: "Invalid authentication type. expected: LDAP (via BindDN), actual: OAuth2",
+			errMsg: "invalid authentication type. expected: LDAP (via BindDN), actual: OAuth2",
 		},
 		// case 24
 		{
@@ -896,15 +736,15 @@ func TestUpdateLdapBindDn(t *testing.T) {
 			initDB: func(context.Context) error {
 				return nil
 			},
-			createAuthSource: func(authSource *auth.Source) error {
-				assert.FailNow(t, "case %d: should not call createAuthSource", n)
+			createAuthSource: func(ctx context.Context, authSource *auth.Source) error {
+				assert.FailNow(t, "createAuthSource called", "case %d: should not call createAuthSource", n)
 				return nil
 			},
-			updateAuthSource: func(authSource *auth.Source) error {
+			updateAuthSource: func(ctx context.Context, authSource *auth.Source) error {
 				updatedAuthSource = authSource
 				return nil
 			},
-			getAuthSourceByID: func(id int64) (*auth.Source, error) {
+			getAuthSourceByID: func(ctx context.Context, id int64) (*auth.Source, error) {
 				if c.id != 0 {
 					assert.Equal(t, c.id, id, "case %d: wrong id", n)
 				}
@@ -919,12 +759,12 @@ func TestUpdateLdapBindDn(t *testing.T) {
 		}
 
 		// Create a copy of command to test
-		app := cli.NewApp()
-		app.Flags = cmdAuthUpdateLdapBindDn.Flags
-		app.Action = service.updateLdapBindDn
-
+		app := cli.Command{
+			Flags:  microcmdAuthUpdateLdapBindDn().Flags,
+			Action: service.updateLdapBindDn,
+		}
 		// Run it
-		err := app.Run(c.args)
+		err := app.Run(t.Context(), c.args)
 		if c.errMsg != "" {
 			assert.EqualError(t, err, c.errMsg, "case %d: error should match", n)
 		} else {
@@ -936,18 +776,23 @@ func TestUpdateLdapBindDn(t *testing.T) {
 
 func TestUpdateLdapSimpleAuth(t *testing.T) {
 	// Mock cli functions to do not exit on error
-	osExiter := cli.OsExiter
-	defer func() { cli.OsExiter = osExiter }()
-	cli.OsExiter = func(code int) {}
+	defer test.MockVariableValue(&cli.OsExiter, func(code int) {})()
 
 	// Test cases
-	cases := []struct {
+	type testCase struct {
 		args               []string
 		id                 int64
 		existingAuthSource *auth.Source
 		authSource         *auth.Source
 		errMsg             string
-	}{
+	}
+	withConfig := func(config *ldap.Source, args ...string) testCase {
+		return testCase{
+			args:       append([]string{"ldap-test", "--id", "1"}, args...),
+			authSource: &auth.Source{Type: auth.DLDAP, Cfg: config},
+		}
+	}
+	cases := []testCase{
 		// case 0
 		{
 			args: []string{
@@ -997,16 +842,7 @@ func TestUpdateLdapSimpleAuth(t *testing.T) {
 			},
 		},
 		// case 1
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg:  &ldap.Source{},
-			},
-		},
+		withConfig(&ldap.Source{}),
 		// case 2
 		{
 			args: []string{
@@ -1041,187 +877,43 @@ func TestUpdateLdapSimpleAuth(t *testing.T) {
 			},
 		},
 		// case 4
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--security-protocol", "starttls",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg: &ldap.Source{
-					SecurityProtocol: ldap.SecurityProtocol(2),
-				},
-			},
-		},
+		withConfig(&ldap.Source{SecurityProtocol: ldap.SecurityProtocol(2)}, "--security-protocol", "starttls"),
 		// case 5
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--skip-tls-verify",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg: &ldap.Source{
-					SkipVerify: true,
-				},
-			},
-		},
+		withConfig(&ldap.Source{SkipVerify: true}, "--skip-tls-verify"),
 		// case 6
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--host", "ldap-server",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg: &ldap.Source{
-					Host: "ldap-server",
-				},
-			},
-		},
+		withConfig(&ldap.Source{Host: "ldap-server"}, "--host", "ldap-server"),
 		// case 7
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--port", "987",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg: &ldap.Source{
-					Port: 987,
-				},
-			},
-		},
+		withConfig(&ldap.Source{Port: 987}, "--port", "987"),
 		// case 8
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--user-search-base", "ou=Users,dc=domain,dc=org",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg: &ldap.Source{
-					UserBase: "ou=Users,dc=domain,dc=org",
-				},
-			},
-		},
+		withConfig(
+			&ldap.Source{UserBase: "ou=Users,dc=domain,dc=org"},
+			"--user-search-base", "ou=Users,dc=domain,dc=org",
+		),
 		// case 9
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--user-filter", "(&(objectClass=posixAccount)(cn=%s))",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg: &ldap.Source{
-					Filter: "(&(objectClass=posixAccount)(cn=%s))",
-				},
-			},
-		},
+		withConfig(
+			&ldap.Source{Filter: "(&(objectClass=posixAccount)(cn=%s))"},
+			"--user-filter", "(&(objectClass=posixAccount)(cn=%s))",
+		),
 		// case 10
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--admin-filter", "(memberOf=cn=admin-group,ou=example,dc=domain,dc=org)",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg: &ldap.Source{
-					AdminFilter: "(memberOf=cn=admin-group,ou=example,dc=domain,dc=org)",
-				},
-			},
-		},
+		withConfig(
+			&ldap.Source{AdminFilter: "(memberOf=cn=admin-group,ou=example,dc=domain,dc=org)"},
+			"--admin-filter", "(memberOf=cn=admin-group,ou=example,dc=domain,dc=org)",
+		),
 		// case 11
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--username-attribute", "uid",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg: &ldap.Source{
-					AttributeUsername: "uid",
-				},
-			},
-		},
+		withConfig(&ldap.Source{AttributeUsername: "uid"}, "--username-attribute", "uid"),
 		// case 12
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--firstname-attribute", "givenName",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg: &ldap.Source{
-					AttributeName: "givenName",
-				},
-			},
-		},
+		withConfig(&ldap.Source{AttributeName: "givenName"}, "--firstname-attribute", "givenName"),
 		// case 13
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--surname-attribute", "sn",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg: &ldap.Source{
-					AttributeSurname: "sn",
-				},
-			},
-		},
+		withConfig(&ldap.Source{AttributeSurname: "sn"}, "--surname-attribute", "sn"),
 		// case 14
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--email-attribute", "mail",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg: &ldap.Source{
-					AttributeMail: "mail",
-				},
-			},
-		},
+		withConfig(&ldap.Source{AttributeMail: "mail"}, "--email-attribute", "mail"),
 		// case 15
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--public-ssh-key-attribute", "publickey",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg: &ldap.Source{
-					AttributeSSHPublicKey: "publickey",
-				},
-			},
-		},
+		withConfig(&ldap.Source{AttributeSSHPublicKey: "publickey"}, "--public-ssh-key-attribute", "publickey"),
 		// case 16
-		{
-			args: []string{
-				"ldap-test",
-				"--id", "1",
-				"--user-dn", "cn=%s,ou=Users,dc=domain,dc=org",
-			},
-			authSource: &auth.Source{
-				Type: auth.DLDAP,
-				Cfg: &ldap.Source{
-					UserDN: "cn=%s,ou=Users,dc=domain,dc=org",
-				},
-			},
-		},
+		withConfig(
+			&ldap.Source{UserDN: "cn=%s,ou=Users,dc=domain,dc=org"},
+			"--user-dn", "cn=%s,ou=Users,dc=domain,dc=org",
+		),
 		// case 17
 		{
 			args: []string{
@@ -1229,7 +921,7 @@ func TestUpdateLdapSimpleAuth(t *testing.T) {
 				"--id", "1",
 				"--security-protocol", "xxxxx",
 			},
-			errMsg: "Unknown security protocol name: xxxxx",
+			errMsg: "unknown security protocol name: xxxxx",
 		},
 		// case 18
 		{
@@ -1248,7 +940,7 @@ func TestUpdateLdapSimpleAuth(t *testing.T) {
 				Type: auth.PAM,
 				Cfg:  &ldap.Source{},
 			},
-			errMsg: "Invalid authentication type. expected: LDAP (simple auth), actual: PAM",
+			errMsg: "invalid authentication type. expected: LDAP (simple auth), actual: PAM",
 		},
 		// case 20
 		{
@@ -1286,15 +978,15 @@ func TestUpdateLdapSimpleAuth(t *testing.T) {
 			initDB: func(context.Context) error {
 				return nil
 			},
-			createAuthSource: func(authSource *auth.Source) error {
-				assert.FailNow(t, "case %d: should not call createAuthSource", n)
+			createAuthSource: func(ctx context.Context, authSource *auth.Source) error {
+				assert.FailNow(t, "createAuthSource called", "case %d: should not call createAuthSource", n)
 				return nil
 			},
-			updateAuthSource: func(authSource *auth.Source) error {
+			updateAuthSource: func(ctx context.Context, authSource *auth.Source) error {
 				updatedAuthSource = authSource
 				return nil
 			},
-			getAuthSourceByID: func(id int64) (*auth.Source, error) {
+			getAuthSourceByID: func(ctx context.Context, id int64) (*auth.Source, error) {
 				if c.id != 0 {
 					assert.Equal(t, c.id, id, "case %d: wrong id", n)
 				}
@@ -1309,12 +1001,12 @@ func TestUpdateLdapSimpleAuth(t *testing.T) {
 		}
 
 		// Create a copy of command to test
-		app := cli.NewApp()
-		app.Flags = cmdAuthUpdateLdapSimpleAuth.Flags
-		app.Action = service.updateLdapSimpleAuth
-
+		app := cli.Command{
+			Flags:  microcmdAuthUpdateLdapSimpleAuth().Flags,
+			Action: service.updateLdapSimpleAuth,
+		}
 		// Run it
-		err := app.Run(c.args)
+		err := app.Run(t.Context(), c.args)
 		if c.errMsg != "" {
 			assert.EqualError(t, err, c.errMsg, "case %d: error should match", n)
 		} else {

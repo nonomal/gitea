@@ -7,19 +7,19 @@ import (
 	"net/http"
 	"strings"
 
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/context"
-	chef_module "code.gitea.io/gitea/modules/packages/chef"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/util"
-	shared "code.gitea.io/gitea/routers/web/shared/packages"
+	user_model "gitea.dev/models/user"
+	chef_module "gitea.dev/modules/packages/chef"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	shared "gitea.dev/routers/web/shared/packages"
+	"gitea.dev/services/context"
 )
 
 const (
-	tplSettingsPackages            base.TplName = "user/settings/packages"
-	tplSettingsPackagesRuleEdit    base.TplName = "user/settings/packages_cleanup_rules_edit"
-	tplSettingsPackagesRulePreview base.TplName = "user/settings/packages_cleanup_rules_preview"
+	tplSettingsPackages            templates.TplName = "user/settings/packages"
+	tplSettingsPackagesRuleEdit    templates.TplName = "user/settings/packages_cleanup_rules_edit"
+	tplSettingsPackagesRulePreview templates.TplName = "user/settings/packages_cleanup_rules_preview"
 )
 
 func Packages(ctx *context.Context) {
@@ -50,7 +50,7 @@ func PackagesRuleEdit(ctx *context.Context) {
 }
 
 func PackagesRuleAddPost(ctx *context.Context) {
-	ctx.Data["Title"] = ctx.Tr("settings")
+	ctx.Data["Title"] = ctx.Tr("settings_title")
 	ctx.Data["PageIsSettingsPackages"] = true
 
 	shared.PerformRuleAddPost(
@@ -103,16 +103,16 @@ func RebuildCargoIndex(ctx *context.Context) {
 func RegenerateChefKeyPair(ctx *context.Context) {
 	priv, pub, err := util.GenerateKeyPair(chef_module.KeyBits)
 	if err != nil {
-		ctx.ServerError("GenerateKeyPair", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
-	if err := user_model.SetUserSetting(ctx.Doer.ID, chef_module.SettingPublicPem, pub); err != nil {
-		ctx.ServerError("SetUserSetting", err)
+	if err := user_model.SetUserSetting(ctx, ctx.Doer.ID, chef_module.SettingPublicPem, pub); err != nil {
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
-	ctx.ServeContent(strings.NewReader(priv), &context.ServeHeaderOptions{
+	ctx.ServeContent(strings.NewReader(priv), context.ServeHeaderOptions{
 		ContentType: "application/x-pem-file",
 		Filename:    ctx.Doer.Name + ".priv",
 	})

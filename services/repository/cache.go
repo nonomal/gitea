@@ -5,41 +5,15 @@ package repository
 
 import (
 	"context"
-	"strings"
 
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/modules/cache"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/git"
 )
 
-func getRefName(fullRefName string) string {
-	if strings.HasPrefix(fullRefName, git.TagPrefix) {
-		return fullRefName[len(git.TagPrefix):]
-	} else if strings.HasPrefix(fullRefName, git.BranchPrefix) {
-		return fullRefName[len(git.BranchPrefix):]
-	}
-	return ""
-}
-
-// CacheRef cachhe last commit information of the branch or the tag
-func CacheRef(ctx context.Context, repo *repo_model.Repository, gitRepo *git.Repository, fullRefName string) error {
-	if !setting.CacheService.LastCommit.Enabled {
-		return nil
-	}
-
-	commit, err := gitRepo.GetCommit(fullRefName)
+// CacheRef caches last commit information of the branch or the tag
+func CacheRef(ctx context.Context, gitRepo *git.Repository, fullRefName git.RefName) error {
+	commit, err := gitRepo.GetCommit(ctx, fullRefName.String())
 	if err != nil {
 		return err
 	}
-
-	if gitRepo.LastCommitCache == nil {
-		commitsCount, err := cache.GetInt64(repo.GetCommitsCountCacheKey(getRefName(fullRefName), true), commit.CommitsCount)
-		if err != nil {
-			return err
-		}
-		gitRepo.LastCommitCache = git.NewLastCommitCache(commitsCount, repo.FullName(), gitRepo, cache.GetCache())
-	}
-
-	return commit.CacheCommit(ctx)
+	return commit.CacheCommit(ctx, gitRepo)
 }

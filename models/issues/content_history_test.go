@@ -6,10 +6,10 @@ package issues_test
 import (
 	"testing"
 
-	"code.gitea.io/gitea/models/db"
-	issues_model "code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/models/unittest"
-	"code.gitea.io/gitea/modules/timeutil"
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/timeutil"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -17,7 +17,7 @@ import (
 func TestContentHistory(t *testing.T) {
 	assert.NoError(t, unittest.PrepareTestDatabase())
 
-	dbCtx := db.DefaultContext
+	dbCtx := t.Context()
 	timeStampNow := timeutil.TimeStampNow()
 
 	_ = issues_model.SaveIssueContentHistory(dbCtx, 1, 10, 0, timeStampNow, "i-a", true)
@@ -46,7 +46,7 @@ func TestContentHistory(t *testing.T) {
 		Name     string
 		FullName string
 	}
-	_ = db.GetEngine(dbCtx).Sync2(&User{})
+	_ = db.GetEngine(dbCtx).Sync(&User{})
 
 	list1, _ := issues_model.FetchIssueContentHistoryList(dbCtx, 10, 0)
 	assert.Len(t, list1, 3)
@@ -58,13 +58,13 @@ func TestContentHistory(t *testing.T) {
 	hasHistory2, _ := issues_model.HasIssueContentHistory(dbCtx, 10, 1)
 	assert.False(t, hasHistory2)
 
-	h6, h6Prev, _ := issues_model.GetIssueContentHistoryAndPrev(dbCtx, 6)
+	h6, h6Prev, _ := issues_model.GetIssueContentHistoryAndPrev(dbCtx, 10, 6)
 	assert.EqualValues(t, 6, h6.ID)
 	assert.EqualValues(t, 5, h6Prev.ID)
 
 	// soft-delete
 	_ = issues_model.SoftDeleteIssueContentHistory(dbCtx, 5)
-	h6, h6Prev, _ = issues_model.GetIssueContentHistoryAndPrev(dbCtx, 6)
+	h6, h6Prev, _ = issues_model.GetIssueContentHistoryAndPrev(dbCtx, 10, 6)
 	assert.EqualValues(t, 6, h6.ID)
 	assert.EqualValues(t, 4, h6Prev.ID)
 
@@ -77,4 +77,23 @@ func TestContentHistory(t *testing.T) {
 	assert.EqualValues(t, 8, list2[0].HistoryID)
 	assert.EqualValues(t, 7, list2[1].HistoryID)
 	assert.EqualValues(t, 4, list2[2].HistoryID)
+}
+
+func TestHasIssueContentHistoryForCommentOnly(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+
+	_ = db.TruncateBeans(t.Context(), &issues_model.ContentHistory{})
+
+	hasHistory1, _ := issues_model.HasIssueContentHistory(t.Context(), 10, 0)
+	assert.False(t, hasHistory1)
+	hasHistory2, _ := issues_model.HasIssueContentHistory(t.Context(), 10, 100)
+	assert.False(t, hasHistory2)
+
+	_ = issues_model.SaveIssueContentHistory(t.Context(), 1, 10, 100, timeutil.TimeStampNow(), "c-a", true)
+	_ = issues_model.SaveIssueContentHistory(t.Context(), 1, 10, 100, timeutil.TimeStampNow().Add(5), "c-b", false)
+
+	hasHistory1, _ = issues_model.HasIssueContentHistory(t.Context(), 10, 0)
+	assert.False(t, hasHistory1)
+	hasHistory2, _ = issues_model.HasIssueContentHistory(t.Context(), 10, 100)
+	assert.True(t, hasHistory2)
 }

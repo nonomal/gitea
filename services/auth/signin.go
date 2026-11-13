@@ -4,30 +4,33 @@
 package auth
 
 import (
+	"context"
 	"strings"
 
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/services/auth/source/oauth2"
-	"code.gitea.io/gitea/services/auth/source/smtp"
+	"gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	"gitea.dev/services/auth/source/oauth2"
+	"gitea.dev/services/auth/source/smtp"
 
-	_ "code.gitea.io/gitea/services/auth/source/db"   // register the sources (and below)
-	_ "code.gitea.io/gitea/services/auth/source/ldap" // register the ldap source
-	_ "code.gitea.io/gitea/services/auth/source/pam"  // register the pam source
-	_ "code.gitea.io/gitea/services/auth/source/sspi" // register the sspi source
+	_ "gitea.dev/services/auth/source/db"   // register the sources (and below)
+	_ "gitea.dev/services/auth/source/ldap" // register the ldap source
+	_ "gitea.dev/services/auth/source/pam"  // register the pam source
+	_ "gitea.dev/services/auth/source/sspi" // register the sspi source
+
+	"xorm.io/builder"
 )
 
 // UserSignIn validates user name and password.
-func UserSignIn(username, password string) (*user_model.User, *auth.Source, error) {
+func UserSignIn(ctx context.Context, username, password string) (*user_model.User, *auth.Source, error) {
 	var user *user_model.User
 	isEmail := false
 	if strings.Contains(username, "@") {
 		isEmail = true
-		emailAddress := user_model.EmailAddress{LowerEmail: strings.ToLower(strings.TrimSpace(username))}
 		// check same email
-		has, err := db.GetEngine(db.DefaultContext).Get(&emailAddress)
+		emailAddress, has, err := db.Get[user_model.EmailAddress](ctx, builder.Eq{"lower_email": strings.ToLower(strings.TrimSpace(username))})
 		if err != nil {
 			return nil, nil, err
 		}
@@ -49,19 +52,33 @@ func UserSignIn(username, password string) (*user_model.User, *auth.Source, erro
 	}
 
 	if user != nil {
-		hasUser, err := user_model.GetUser(user)
-		if err != nil {
-			return nil, nil, err
+		var hasUser bool
+		var err error
+		if user.ID > 0 {
+			user, err = user_model.GetUserByID(ctx, user.ID)
+			if err != nil && !user_model.IsErrUserNotExist(err) {
+				return nil, nil, err
+			}
+			if user != nil && user.Type != user_model.UserTypeIndividual {
+				return nil, nil, user_model.ErrUserNotExist{Name: username}
+			}
+			hasUser = user != nil
+		} else if user.LowerName != "" {
+			user, err = user_model.GetIndividualUserByName(ctx, user.LowerName)
+			if err != nil && !user_model.IsErrUserNotExist(err) {
+				return nil, nil, err
+			}
+			hasUser = user != nil
 		}
 
 		if hasUser {
-			source, err := auth.GetSourceByID(user.LoginSource)
+			source, err := auth.GetSourceByID(ctx, user.LoginSource)
 			if err != nil {
 				return nil, nil, err
 			}
 
 			if !source.IsActive {
-				return nil, nil, oauth2.ErrAuthSourceNotActived
+				return nil, nil, oauth2.ErrAuthSourceNotActivated
 			}
 
 			authenticator, ok := source.Cfg.(PasswordAuthenticator)
@@ -69,7 +86,7 @@ func UserSignIn(username, password string) (*user_model.User, *auth.Source, erro
 				return nil, nil, smtp.ErrUnsupportedLoginType
 			}
 
-			user, err := authenticator.Authenticate(user, user.LoginName, password)
+			user, err := authenticator.Authenticate(ctx, user, user.LoginName, password)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -84,7 +101,9 @@ func UserSignIn(username, password string) (*user_model.User, *auth.Source, erro
 		}
 	}
 
-	sources, err := auth.AllActiveSources()
+	sources, err := db.Find[auth.Source](ctx, auth.FindSourcesOptions{
+		IsActive: optional.Some(true),
+	})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -100,13 +119,17 @@ func UserSignIn(username, password string) (*user_model.User, *auth.Source, erro
 			continue
 		}
 
-		authUser, err := authenticator.Authenticate(nil, username, password)
+		authUser, err := authenticator.Authenticate(ctx, nil, username, password)
 
 		if err == nil {
-			if !authUser.ProhibitLogin {
+			switch {
+			case !authUser.IsIndividual():
+				err = user_model.ErrUserNotExist{Name: username}
+			case authUser.ProhibitLogin:
+				err = user_model.ErrUserProhibitLogin{UID: authUser.ID, Name: authUser.Name}
+			default:
 				return authUser, source, nil
 			}
-			err = user_model.ErrUserProhibitLogin{UID: authUser.ID, Name: authUser.Name}
 		}
 
 		if user_model.IsErrUserNotExist(err) {

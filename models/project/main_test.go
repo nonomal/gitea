@@ -4,17 +4,15 @@
 package project
 
 import (
-	"path/filepath"
 	"testing"
 
-	"code.gitea.io/gitea/models/unittest"
+	"gitea.dev/models/unittest"
 
-	_ "code.gitea.io/gitea/models/repo"
+	_ "gitea.dev/models/repo"
 )
 
 func TestMain(m *testing.M) {
 	unittest.MainTest(m, &unittest.TestOptions{
-		GiteaRootPath: filepath.Join("..", ".."),
 		FixtureFiles: []string{
 			"project.yml",
 			"project_board.yml",

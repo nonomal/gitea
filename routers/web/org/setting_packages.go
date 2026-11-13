@@ -7,22 +7,28 @@ import (
 	"fmt"
 	"net/http"
 
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/setting"
-	shared "code.gitea.io/gitea/routers/web/shared/packages"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	shared "gitea.dev/routers/web/shared/packages"
+	shared_user "gitea.dev/routers/web/shared/user"
+	"gitea.dev/services/context"
 )
 
 const (
-	tplSettingsPackages            base.TplName = "org/settings/packages"
-	tplSettingsPackagesRuleEdit    base.TplName = "org/settings/packages_cleanup_rules_edit"
-	tplSettingsPackagesRulePreview base.TplName = "org/settings/packages_cleanup_rules_preview"
+	tplSettingsPackages            templates.TplName = "org/settings/packages"
+	tplSettingsPackagesRuleEdit    templates.TplName = "org/settings/packages_cleanup_rules_edit"
+	tplSettingsPackagesRulePreview templates.TplName = "org/settings/packages_cleanup_rules_preview"
 )
 
 func Packages(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("packages.title")
 	ctx.Data["PageIsOrgSettings"] = true
 	ctx.Data["PageIsSettingsPackages"] = true
+
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerErrorAuto(err)
+		return
+	}
 
 	shared.SetPackagesContext(ctx, ctx.ContextUser)
 
@@ -34,6 +40,11 @@ func PackagesRuleAdd(ctx *context.Context) {
 	ctx.Data["PageIsOrgSettings"] = true
 	ctx.Data["PageIsSettingsPackages"] = true
 
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerErrorAuto(err)
+		return
+	}
+
 	shared.SetRuleAddContext(ctx)
 
 	ctx.HTML(http.StatusOK, tplSettingsPackagesRuleEdit)
@@ -43,6 +54,11 @@ func PackagesRuleEdit(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("packages.title")
 	ctx.Data["PageIsOrgSettings"] = true
 	ctx.Data["PageIsSettingsPackages"] = true
+
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerErrorAuto(err)
+		return
+	}
 
 	shared.SetRuleEditContext(ctx, ctx.ContextUser)
 
@@ -79,6 +95,11 @@ func PackagesRulePreview(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("packages.title")
 	ctx.Data["PageIsOrgSettings"] = true
 	ctx.Data["PageIsSettingsPackages"] = true
+
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerErrorAuto(err)
+		return
+	}
 
 	shared.SetRulePreviewContext(ctx, ctx.ContextUser)
 

@@ -4,30 +4,47 @@
 package pipeline
 
 import (
-	"bytes"
+	"bufio"
 	"context"
-	"fmt"
-	"io"
+	"errors"
 	"strings"
-	"sync"
 
-	"code.gitea.io/gitea/modules/git"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitcmd"
+
+	"golang.org/x/sync/errgroup"
 )
 
-// NameRevStdin runs name-rev --stdin
-func NameRevStdin(ctx context.Context, shasToNameReader *io.PipeReader, nameRevStdinWriter *io.PipeWriter, wg *sync.WaitGroup, tmpBasePath string) {
-	defer wg.Done()
-	defer shasToNameReader.Close()
-	defer nameRevStdinWriter.Close()
+func fillResultNameRev(ctx context.Context, repo git.RepositoryFacade, results []*LFSResult) error {
+	wg := errgroup.Group{}
+	cmd := gitcmd.NewCommand("name-rev", "--stdin", "--name-only", "--always").WithRepo(repo)
+	stdin, stdinClose := cmd.MakeStdinPipe()
+	defer stdinClose()
 
-	stderr := new(bytes.Buffer)
-	var errbuf strings.Builder
-	if err := git.NewCommand(ctx, "name-rev", "--stdin", "--name-only", "--always").Run(&git.RunOpts{
-		Dir:    tmpBasePath,
-		Stdout: nameRevStdinWriter,
-		Stdin:  shasToNameReader,
-		Stderr: stderr,
-	}); err != nil {
-		_ = shasToNameReader.CloseWithError(fmt.Errorf("git name-rev [%s]: %w - %s", tmpBasePath, err, errbuf.String()))
-	}
+	wg.Go(func() error {
+		defer stdinClose()
+		for _, result := range results {
+			_, err := stdin.Write([]byte(result.SHA))
+			if err != nil {
+				return err
+			}
+			_, err = stdin.Write([]byte{'\n'})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	idx := 0
+	err := gitcmd.RunWithScannerSplit(ctx, cmd, bufio.ScanLines, func(ctx gitcmd.Context, chunk []byte) error {
+		line := string(chunk)
+		if idx < len(results) {
+			results[idx].FullCommitName = line
+			results[idx].BranchName = strings.Split(line, "~")[0]
+		}
+		idx++
+		return nil
+	})
+	return errors.Join(err, wg.Wait())
 }

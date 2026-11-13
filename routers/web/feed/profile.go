@@ -6,10 +6,15 @@ package feed
 import (
 	"time"
 
-	activities_model "code.gitea.io/gitea/models/activities"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/markup"
-	"code.gitea.io/gitea/modules/markup/markdown"
+	activities_model "gitea.dev/models/activities"
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/organization"
+	"gitea.dev/models/renderhelper"
+	"gitea.dev/modules/markup/markdown"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/context"
+	feed_service "gitea.dev/services/feed"
 
 	"github.com/gorilla/feeds"
 )
@@ -26,9 +31,28 @@ func ShowUserFeedAtom(ctx *context.Context) {
 
 // showUserFeed show user activity as RSS / Atom feed
 func showUserFeed(ctx *context.Context, formatType string) {
-	includePrivate := ctx.IsSigned && (ctx.Doer.IsAdmin || ctx.Doer.ID == ctx.ContextUser.ID)
+	if !setting.Other.EnableFeed {
+		ctx.NotFound()
+		return
+	}
+	context.CheckTokenScopes(ctx, util.Iif(ctx.ContextUser.IsOrganization(), auth_model.AccessTokenScopeReadOrganization, auth_model.AccessTokenScopeReadUser))
+	if ctx.Written() {
+		return
+	}
 
-	actions, _, err := activities_model.GetFeeds(ctx, activities_model.GetFeedsOptions{
+	includePrivate := ctx.IsSigned && (ctx.Doer.IsAdmin || ctx.Doer.ID == ctx.ContextUser.ID)
+	if ctx.IsSigned && ctx.ContextUser.IsOrganization() && !includePrivate {
+		// When feed is requested by a member of the organization,
+		// include the private repo's the member has access to.
+		isOrgMember, err := organization.IsOrganizationMember(ctx, ctx.ContextUser.ID, ctx.Doer.ID)
+		if err != nil {
+			ctx.ServerErrorAuto(err)
+			return
+		}
+		includePrivate = isOrgMember
+	}
+
+	actions, _, err := feed_service.GetFeeds(ctx, activities_model.GetFeedsOptions{
 		RequestedUser:   ctx.ContextUser,
 		Actor:           ctx.Doer,
 		IncludePrivate:  includePrivate,
@@ -37,32 +61,28 @@ func showUserFeed(ctx *context.Context, formatType string) {
 		Date:            ctx.FormString("date"),
 	})
 	if err != nil {
-		ctx.ServerError("GetFeeds", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
-	ctxUserDescription, err := markdown.RenderString(&markup.RenderContext{
-		Ctx:       ctx,
-		URLPrefix: ctx.ContextUser.HTMLURL(),
-		Metas: map[string]string{
-			"user": ctx.ContextUser.GetDisplayName(),
-		},
-	}, ctx.ContextUser.Description)
+	rctx := renderhelper.NewRenderContextSimpleDocument(ctx, ctx.ContextUser.HTMLURL(ctx))
+	ctxUserDescription, err := markdown.RenderString(rctx,
+		ctx.ContextUser.Description)
 	if err != nil {
-		ctx.ServerError("RenderString", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
 	feed := &feeds.Feed{
-		Title:       ctx.Tr("home.feed_of", ctx.ContextUser.DisplayName()),
-		Link:        &feeds.Link{Href: ctx.ContextUser.HTMLURL()},
-		Description: ctxUserDescription,
+		Title:       ctx.Locale.TrString("home.feed_of", ctx.ContextUser.DisplayName()),
+		Link:        &feeds.Link{Href: ctx.ContextUser.HTMLURL(ctx)},
+		Description: string(ctxUserDescription),
 		Created:     time.Now(),
 	}
 
 	feed.Items, err = feedActionsToFeedItems(ctx, actions)
 	if err != nil {
-		ctx.ServerError("convert feed", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
@@ -72,14 +92,14 @@ func showUserFeed(ctx *context.Context, formatType string) {
 // writeFeed write a feeds.Feed as atom or rss to ctx.Resp
 func writeFeed(ctx *context.Context, feed *feeds.Feed, formatType string) {
 	if formatType == "atom" {
-		ctx.Resp.Header().Set("Content-Type", "application/atom+xml;charset=utf-8")
+		ctx.Resp.Header().Set("Content-Type", ContentTypeAtomXml+"; charset=utf-8")
 		if err := feed.WriteAtom(ctx.Resp); err != nil {
-			ctx.ServerError("Render Atom failed", err)
+			ctx.ServerErrorAuto(err)
 		}
 	} else {
-		ctx.Resp.Header().Set("Content-Type", "application/rss+xml;charset=utf-8")
+		ctx.Resp.Header().Set("Content-Type", ContentTypeRssXml+"; charset=utf-8")
 		if err := feed.WriteRss(ctx.Resp); err != nil {
-			ctx.ServerError("Render RSS failed", err)
+			ctx.ServerErrorAuto(err)
 		}
 	}
 }

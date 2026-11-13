@@ -8,12 +8,15 @@ import (
 	"compress/gzip"
 	"io"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/modules/validation"
+	"gitea.dev/modules/packages"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/validation"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v4"
 )
 
 var (
@@ -23,9 +26,19 @@ var (
 	ErrInvalidName = util.NewInvalidArgumentErrorf("package name is invalid")
 	// ErrInvalidVersion indicates an invalid version in the metadata.gz file
 	ErrInvalidVersion = util.NewInvalidArgumentErrorf("package version is invalid")
+	// ErrInvalidMetadata indicates metadata that would corrupt the generated index
+	ErrInvalidMetadata = util.NewInvalidArgumentErrorf("package metadata is invalid")
 )
 
-var versionMatcher = regexp.MustCompile(`\A[0-9]+(?:\.[0-9a-zA-Z]+)*(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z`)
+var globalVars = sync.OnceValue(func() (ret struct {
+	nameMatcher, versionMatcher *regexp.Regexp
+},
+) {
+	// https://github.com/rubygems/rubygems/blob/master/lib/rubygems/specification.rb (VALID_NAME_PATTERN)
+	ret.nameMatcher = regexp.MustCompile(`\A[\w.-]+\z`)
+	ret.versionMatcher = regexp.MustCompile(`\A[0-9]+(?:\.[0-9a-zA-Z]+)*(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z`)
+	return ret
+})
 
 // Package represents a RubyGems package
 type Package struct {
@@ -65,12 +78,12 @@ type gemspec struct {
 	Version struct {
 		Version string `yaml:"version"`
 	} `yaml:"version"`
-	Platform     string        `yaml:"platform"`
-	Authors      []string      `yaml:"authors"`
-	Autorequire  interface{}   `yaml:"autorequire"`
-	Bindir       string        `yaml:"bindir"`
-	CertChain    []interface{} `yaml:"cert_chain"`
-	Date         string        `yaml:"date"`
+	Platform     string   `yaml:"platform"`
+	Authors      []string `yaml:"authors"`
+	Autorequire  any      `yaml:"autorequire"`
+	Bindir       string   `yaml:"bindir"`
+	CertChain    []any    `yaml:"cert_chain"`
+	Date         string   `yaml:"date"`
 	Dependencies []struct {
 		Name                string      `yaml:"name"`
 		Requirement         requirement `yaml:"requirement"`
@@ -78,34 +91,34 @@ type gemspec struct {
 		Prerelease          bool        `yaml:"prerelease"`
 		VersionRequirements requirement `yaml:"version_requirements"`
 	} `yaml:"dependencies"`
-	Description    string        `yaml:"description"`
-	Executables    []string      `yaml:"executables"`
-	Extensions     []interface{} `yaml:"extensions"`
-	ExtraRdocFiles []string      `yaml:"extra_rdoc_files"`
-	Files          []string      `yaml:"files"`
-	Homepage       string        `yaml:"homepage"`
-	Licenses       []string      `yaml:"licenses"`
+	Description    string   `yaml:"description"`
+	Executables    []string `yaml:"executables"`
+	Extensions     []any    `yaml:"extensions"`
+	ExtraRdocFiles []string `yaml:"extra_rdoc_files"`
+	Files          []string `yaml:"files"`
+	Homepage       string   `yaml:"homepage"`
+	Licenses       []string `yaml:"licenses"`
 	Metadata       struct {
 		BugTrackerURI    string `yaml:"bug_tracker_uri"`
 		ChangelogURI     string `yaml:"changelog_uri"`
 		DocumentationURI string `yaml:"documentation_uri"`
 		SourceCodeURI    string `yaml:"source_code_uri"`
 	} `yaml:"metadata"`
-	PostInstallMessage      interface{}   `yaml:"post_install_message"`
-	RdocOptions             []interface{} `yaml:"rdoc_options"`
-	RequirePaths            []string      `yaml:"require_paths"`
-	RequiredRubyVersion     requirement   `yaml:"required_ruby_version"`
-	RequiredRubygemsVersion requirement   `yaml:"required_rubygems_version"`
-	Requirements            []interface{} `yaml:"requirements"`
-	RubygemsVersion         string        `yaml:"rubygems_version"`
-	SigningKey              interface{}   `yaml:"signing_key"`
-	SpecificationVersion    int           `yaml:"specification_version"`
-	Summary                 string        `yaml:"summary"`
-	TestFiles               []interface{} `yaml:"test_files"`
+	PostInstallMessage      any         `yaml:"post_install_message"`
+	RdocOptions             []any       `yaml:"rdoc_options"`
+	RequirePaths            []string    `yaml:"require_paths"`
+	RequiredRubyVersion     requirement `yaml:"required_ruby_version"`
+	RequiredRubygemsVersion requirement `yaml:"required_rubygems_version"`
+	Requirements            []any       `yaml:"requirements"`
+	RubygemsVersion         string      `yaml:"rubygems_version"`
+	SigningKey              any         `yaml:"signing_key"`
+	SpecificationVersion    int         `yaml:"specification_version"`
+	Summary                 string      `yaml:"summary"`
+	TestFiles               []any       `yaml:"test_files"`
 }
 
 type requirement struct {
-	Requirements [][]interface{} `yaml:"requirements"`
+	Requirements [][]any `yaml:"requirements"`
 }
 
 // AsVersionRequirement converts into []VersionRequirement
@@ -119,7 +132,7 @@ func (r requirement) AsVersionRequirement() []VersionRequirement {
 		if !ok {
 			continue
 		}
-		vm, ok := req[1].(map[string]interface{})
+		vm, ok := req[1].(map[string]any)
 		if !ok {
 			continue
 		}
@@ -128,7 +141,7 @@ func (r requirement) AsVersionRequirement() []VersionRequirement {
 			continue
 		}
 		version, ok := versionInt.(string)
-		if !ok || version == "0" {
+		if !ok || (version == "0" && restriction == ">=") {
 			continue
 		}
 
@@ -168,15 +181,15 @@ func parseMetadataFile(r io.Reader) (*Package, error) {
 	defer zr.Close()
 
 	var spec gemspec
-	if err := yaml.NewDecoder(zr).Decode(&spec); err != nil {
+	if err := yaml.NewDecoder(packages.NewLimitedReader(zr, packages.MaxMetadataSize)).Decode(&spec); err != nil {
 		return nil, err
 	}
 
-	if len(spec.Name) == 0 || strings.Contains(spec.Name, "/") {
+	if !globalVars().nameMatcher.MatchString(spec.Name) {
 		return nil, ErrInvalidName
 	}
 
-	if !versionMatcher.MatchString(spec.Version.Version) {
+	if !globalVars().versionMatcher.MatchString(spec.Version.Version) {
 		return nil, ErrInvalidVersion
 	}
 
@@ -210,6 +223,19 @@ func parseMetadataFile(r io.Reader) (*Package, error) {
 		} else {
 			m.DevelopmentDependencies = append(m.DevelopmentDependencies, dep)
 		}
+	}
+
+	values := []string{m.Platform}
+	reqs := slices.Concat(m.RequiredRubyVersion, m.RequiredRubygemsVersion)
+	for _, dep := range slices.Concat(m.RuntimeDependencies, m.DevelopmentDependencies) {
+		values = append(values, dep.Name)
+		reqs = append(reqs, dep.Version...)
+	}
+	for _, req := range reqs {
+		values = append(values, req.Restriction, req.Version)
+	}
+	if slices.ContainsFunc(values, func(s string) bool { return strings.ContainsAny(s, "\r\n") }) {
+		return nil, ErrInvalidMetadata // the compact index is line-based, a line break would forge entries
 	}
 
 	return &Package{

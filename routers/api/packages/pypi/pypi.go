@@ -10,42 +10,48 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"unicode"
 
-	packages_model "code.gitea.io/gitea/models/packages"
-	"code.gitea.io/gitea/modules/context"
-	packages_module "code.gitea.io/gitea/modules/packages"
-	pypi_module "code.gitea.io/gitea/modules/packages/pypi"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/validation"
-	"code.gitea.io/gitea/routers/api/packages/helper"
-	packages_service "code.gitea.io/gitea/services/packages"
+	packages_model "gitea.dev/models/packages"
+	packages_module "gitea.dev/modules/packages"
+	pypi_module "gitea.dev/modules/packages/pypi"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/validation"
+	"gitea.dev/routers/api/packages/helper"
+	"gitea.dev/services/context"
+	packages_service "gitea.dev/services/packages"
 )
 
 // https://peps.python.org/pep-0426/#name
-var (
-	normalizer  = strings.NewReplacer(".", "-", "_", "-")
-	nameMatcher = regexp.MustCompile(`\A(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\.\-_]*[a-zA-Z0-9])\z`)
-)
+var globalVars = sync.OnceValue(func() (ret struct {
+	nameMatcher    *regexp.Regexp
+	versionMatcher *regexp.Regexp
+},
+) {
+	ret.nameMatcher = regexp.MustCompile(`\A(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\.\-_]*[a-zA-Z0-9])\z`)
+	// https://peps.python.org/pep-0440/#appendix-b-parsing-version-strings-with-regular-expressions
+	ret.versionMatcher = regexp.MustCompile(`\Av?` +
+		`(?:[0-9]+!)?` + // epoch
+		`[0-9]+(?:\.[0-9]+)*` + // release segment
+		`(?:[-_\.]?(?:a|b|c|rc|alpha|beta|pre|preview)[-_\.]?[0-9]*)?` + // pre-release
+		`(?:-[0-9]+|[-_\.]?(?:post|rev|r)[-_\.]?[0-9]*)?` + // post release
+		`(?:[-_\.]?dev[-_\.]?[0-9]*)?` + // dev release
+		`(?:\+[a-z0-9]+(?:[-_\.][a-z0-9]+)*)?` + // local version
+		`\z`)
+	return ret
+})
 
-// https://peps.python.org/pep-0440/#appendix-b-parsing-version-strings-with-regular-expressions
-var versionMatcher = regexp.MustCompile(`\Av?` +
-	`(?:[0-9]+!)?` + // epoch
-	`[0-9]+(?:\.[0-9]+)*` + // release segment
-	`(?:[-_\.]?(?:a|b|c|rc|alpha|beta|pre|preview)[-_\.]?[0-9]*)?` + // pre-release
-	`(?:-[0-9]+|[-_\.]?(?:post|rev|r)[-_\.]?[0-9]*)?` + // post release
-	`(?:[-_\.]?dev[-_\.]?[0-9]*)?` + // dev release
-	`(?:\+[a-z0-9]+(?:[-_\.][a-z0-9]+)*)?` + // local version
-	`\z`)
+var normalizer = strings.NewReplacer(".", "-", "_", "-")
 
-func apiError(ctx *context.Context, status int, obj interface{}) {
-	helper.LogAndProcessError(ctx, status, obj, func(message string) {
-		ctx.PlainText(status, message)
-	})
+func apiError(ctx *context.Context, status int, obj any) {
+	message := helper.ProcessErrorForUser(ctx, status, obj)
+	ctx.PlainText(status, message)
 }
 
 // PackageMetadata returns the metadata for a single package
 func PackageMetadata(ctx *context.Context) {
-	packageName := normalizer.Replace(ctx.Params("id"))
+	packageName := normalizer.Replace(ctx.PathParam("id"))
 
 	pvs, err := packages_model.GetVersionsByPackageName(ctx, ctx.Package.Owner.ID, packages_model.TypePyPI, packageName)
 	if err != nil {
@@ -76,11 +82,11 @@ func PackageMetadata(ctx *context.Context) {
 
 // DownloadPackageFile serves the content of a package
 func DownloadPackageFile(ctx *context.Context) {
-	packageName := normalizer.Replace(ctx.Params("id"))
-	packageVersion := ctx.Params("version")
-	filename := ctx.Params("filename")
+	packageName := normalizer.Replace(ctx.PathParam("id"))
+	packageVersion := ctx.PathParam("version")
+	filename := ctx.PathParam("filename")
 
-	s, pf, err := packages_service.GetFileStreamByPackageNameAndVersion(
+	s, u, pf, err := packages_service.OpenFileForDownloadByPackageNameAndVersion(
 		ctx,
 		&packages_service.PackageInfo{
 			Owner:       ctx.Package.Owner,
@@ -91,21 +97,14 @@ func DownloadPackageFile(ctx *context.Context) {
 		&packages_service.PackageFileInfo{
 			Filename: filename,
 		},
+		ctx.Req.Method,
 	)
 	if err != nil {
-		if err == packages_model.ErrPackageNotExist || err == packages_model.ErrPackageFileNotExist {
-			apiError(ctx, http.StatusNotFound, err)
-			return
-		}
-		apiError(ctx, http.StatusInternalServerError, err)
+		apiError(ctx, helper.PackageErrorStatus(err), err)
 		return
 	}
-	defer s.Close()
 
-	ctx.ServeContent(s, &context.ServeHeaderOptions{
-		Filename:     pf.Name,
-		LastModified: pf.CreatedUnix.AsLocalTime(),
-	})
+	helper.ServePackageFile(ctx, s, u, pf)
 }
 
 // UploadPackageFile adds a file to the package. If the package does not exist, it gets created.
@@ -117,7 +116,7 @@ func UploadPackageFile(ctx *context.Context) {
 	}
 	defer file.Close()
 
-	buf, err := packages_module.CreateHashedBufferFromReader(file, 32*1024*1024)
+	buf, err := packages_module.CreateHashedBufferFromReader(file)
 	if err != nil {
 		apiError(ctx, http.StatusInternalServerError, err)
 		return
@@ -143,12 +142,34 @@ func UploadPackageFile(ctx *context.Context) {
 		return
 	}
 
-	projectURL := ctx.Req.FormValue("home_page")
-	if !validation.IsValidURL(projectURL) {
-		projectURL = ""
+	// Ensure ctx.Req.Form exists.
+	_ = ctx.Req.ParseForm()
+
+	var homepageURL string
+	projectURLs := ctx.Req.Form["project_urls"]
+	for _, purl := range projectURLs {
+		label, url, found := strings.Cut(purl, ",")
+		if !found {
+			continue
+		}
+		if normalizeLabel(label) != "homepage" {
+			continue
+		}
+		homepageURL = strings.TrimSpace(url)
+		break
+	}
+
+	if len(homepageURL) == 0 {
+		// TODO: Home-page is a deprecated metadata field. Remove this branch once it's no longer apart of the spec.
+		homepageURL = ctx.Req.FormValue("home_page")
+	}
+
+	if !validation.IsValidURL(homepageURL) {
+		homepageURL = ""
 	}
 
 	_, _, err = packages_service.CreatePackageOrAddFileToExisting(
+		ctx,
 		&packages_service.PackageCreationInfo{
 			PackageInfo: packages_service.PackageInfo{
 				Owner:       ctx.Package.Owner,
@@ -163,7 +184,7 @@ func UploadPackageFile(ctx *context.Context) {
 				Description:     ctx.Req.FormValue("description"),
 				LongDescription: ctx.Req.FormValue("long_description"),
 				Summary:         ctx.Req.FormValue("summary"),
-				ProjectURL:      projectURL,
+				ProjectURL:      homepageURL,
 				License:         ctx.Req.FormValue("license"),
 				RequiresPython:  ctx.Req.FormValue("requires_python"),
 			},
@@ -180,7 +201,7 @@ func UploadPackageFile(ctx *context.Context) {
 	if err != nil {
 		switch err {
 		case packages_model.ErrDuplicatePackageFile:
-			apiError(ctx, http.StatusBadRequest, err)
+			apiError(ctx, http.StatusConflict, err)
 		case packages_service.ErrQuotaTotalCount, packages_service.ErrQuotaTypeSize, packages_service.ErrQuotaTotalSize:
 			apiError(ctx, http.StatusForbidden, err)
 		default:
@@ -192,6 +213,23 @@ func UploadPackageFile(ctx *context.Context) {
 	ctx.Status(http.StatusCreated)
 }
 
+// Normalizes a Project-URL label.
+// See https://packaging.python.org/en/latest/specifications/well-known-project-urls/#label-normalization.
+func normalizeLabel(label string) string {
+	var builder strings.Builder
+
+	// "A label is normalized by deleting all ASCII punctuation and whitespace, and then converting the result
+	// to lowercase."
+	for _, r := range label {
+		if unicode.IsPunct(r) || unicode.IsSpace(r) {
+			continue
+		}
+		builder.WriteRune(unicode.ToLower(r))
+	}
+
+	return builder.String()
+}
+
 func isValidNameAndVersion(packageName, packageVersion string) bool {
-	return nameMatcher.MatchString(packageName) && versionMatcher.MatchString(packageVersion)
+	return globalVars().nameMatcher.MatchString(packageName) && globalVars().versionMatcher.MatchString(packageVersion)
 }

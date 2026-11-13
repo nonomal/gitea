@@ -6,10 +6,11 @@ package issues
 import (
 	"context"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/timeutil"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
 )
 
 // IssueWatch is connection request for receiving issue notification.
@@ -30,8 +31,8 @@ func init() {
 type IssueWatchList []*IssueWatch
 
 // CreateOrUpdateIssueWatch set watching for a user and issue
-func CreateOrUpdateIssueWatch(userID, issueID int64, isWatching bool) error {
-	iw, exists, err := GetIssueWatch(db.DefaultContext, userID, issueID)
+func CreateOrUpdateIssueWatch(ctx context.Context, userID, issueID int64, isWatching bool) error {
+	iw, exists, err := GetIssueWatch(ctx, userID, issueID)
 	if err != nil {
 		return err
 	}
@@ -43,13 +44,13 @@ func CreateOrUpdateIssueWatch(userID, issueID int64, isWatching bool) error {
 			IsWatching: isWatching,
 		}
 
-		if _, err := db.GetEngine(db.DefaultContext).Insert(iw); err != nil {
+		if _, err := db.GetEngine(ctx).Insert(iw); err != nil {
 			return err
 		}
 	} else {
 		iw.IsWatching = isWatching
 
-		if _, err := db.GetEngine(db.DefaultContext).ID(iw.ID).Cols("is_watching", "updated_unix").Update(iw); err != nil {
+		if _, err := db.GetEngine(ctx).ID(iw.ID).Cols("is_watching", "updated_unix").Update(iw); err != nil {
 			return err
 		}
 	}
@@ -67,21 +68,24 @@ func GetIssueWatch(ctx context.Context, userID, issueID int64) (iw *IssueWatch, 
 	return iw, exists, err
 }
 
-// CheckIssueWatch check if an user is watching an issue
+// CheckIssueWatch check if	a user is watching an issue
 // it takes participants and repo watch into account
-func CheckIssueWatch(user *user_model.User, issue *Issue) (bool, error) {
-	iw, exist, err := GetIssueWatch(db.DefaultContext, user.ID, issue.ID)
+func CheckIssueWatch(ctx context.Context, user *user_model.User, issue *Issue) (bool, error) {
+	iw, exist, err := GetIssueWatch(ctx, user.ID, issue.ID)
 	if err != nil {
 		return false, err
 	}
 	if exist {
 		return iw.IsWatching, nil
 	}
-	w, err := repo_model.GetWatch(db.DefaultContext, user.ID, issue.RepoID)
+	w, err := repo_model.GetWatch(ctx, user.ID, issue.RepoID)
 	if err != nil {
 		return false, err
 	}
-	return repo_model.IsWatchMode(w.Mode) || IsUserParticipantsOfIssue(user, issue), nil
+	if repo_model.IsWatchModeWatching(w.Mode) && util.Iif(issue.IsPull, w.IncludePullRequests, w.IncludeIssues) {
+		return true, nil
+	}
+	return IsUserParticipantsOfIssue(ctx, user, issue), nil
 }
 
 // GetIssueWatchersIDs returns IDs of subscribers or explicit unsubscribers to a given issue id
@@ -105,8 +109,8 @@ func GetIssueWatchers(ctx context.Context, issueID int64, listOptions db.ListOpt
 		And("`user`.prohibit_login = ?", false).
 		Join("INNER", "`user`", "`user`.id = `issue_watch`.user_id")
 
-	if listOptions.Page != 0 {
-		sess = db.SetSessionPagination(sess, &listOptions)
+	if listOptions.Page > 0 {
+		db.SetSessionPagination(sess, &listOptions)
 		watches := make([]*IssueWatch, 0, listOptions.PageSize)
 		return watches, sess.Find(&watches)
 	}

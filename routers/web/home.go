@@ -8,54 +8,38 @@ import (
 	"net/http"
 	"strconv"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/sitemap"
-	"code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/modules/web/middleware"
-	"code.gitea.io/gitea/routers/web/auth"
-	"code.gitea.io/gitea/routers/web/user"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/sitemap"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/templates"
+	"gitea.dev/routers/web/feed"
+	"gitea.dev/routers/web/user"
+	"gitea.dev/services/context"
 )
 
-const (
-	// tplHome home page template
-	tplHome base.TplName = "home"
-)
+const tplHome templates.TplName = "home"
 
-// Home render home page
 func Home(ctx *context.Context) {
-	if ctx.IsSigned {
-		if !ctx.Doer.IsActive && setting.Service.RegisterEmailConfirm {
-			ctx.Data["Title"] = ctx.Tr("auth.active_your_account")
-			ctx.HTML(http.StatusOK, auth.TplActivate)
-		} else if !ctx.Doer.IsActive || ctx.Doer.ProhibitLogin {
-			log.Info("Failed authentication attempt for %s from %s", ctx.Doer.Name, ctx.RemoteAddr())
-			ctx.Data["Title"] = ctx.Tr("auth.prohibit_login")
-			ctx.HTML(http.StatusOK, "user/auth/prohibit_login")
-		} else if ctx.Doer.MustChangePassword {
-			ctx.Data["Title"] = ctx.Tr("auth.must_change_password")
-			ctx.Data["ChangePasscodeLink"] = setting.AppSubURL + "/user/change_password"
-			middleware.SetRedirectToCookie(ctx.Resp, setting.AppSubURL+ctx.Req.URL.RequestURI())
-			ctx.Redirect(setting.AppSubURL + "/user/settings/change_password")
-		} else {
-			user.Dashboard(ctx)
-		}
+	if _, feedType := feed.GetFeedType(ctx.Req.URL.Path, ctx.Req); feedType != "" {
+		ctx.Resp.WriteHeader(http.StatusUnsupportedMediaType)
 		return
-		// Check non-logged users landing page.
+	}
+	if ctx.IsSigned {
+		user.Dashboard(ctx)
+		return
 	} else if setting.LandingPageURL != setting.LandingPageHome {
+		// Check non-logged users landing page
 		ctx.Redirect(setting.AppSubURL + string(setting.LandingPageURL))
 		return
 	}
 
 	// Check auto-login.
-	uname := ctx.GetSiteCookie(setting.CookieUserName)
-	if len(uname) != 0 {
+	if ctx.GetSiteCookie(setting.CookieRememberName) != "" {
 		ctx.Redirect(setting.AppSubURL + "/user/login")
 		return
 	}
@@ -69,14 +53,14 @@ func Home(ctx *context.Context) {
 func HomeSitemap(ctx *context.Context) {
 	m := sitemap.NewSitemapIndex()
 	if !setting.Service.Explore.DisableUsersPage {
-		_, cnt, err := user_model.SearchUsers(&user_model.SearchUserOptions{
-			Type:        user_model.UserTypeIndividual,
+		_, cnt, err := user_model.SearchUsers(ctx, user_model.SearchUserOptions{
+			Types:       []user_model.UserType{user_model.UserTypeIndividual},
 			ListOptions: db.ListOptions{PageSize: 1},
-			IsActive:    util.OptionalBoolTrue,
+			IsActive:    optional.Some(true),
 			Visible:     []structs.VisibleType{structs.VisibleTypePublic},
 		})
 		if err != nil {
-			ctx.ServerError("SearchUsers", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 		count := int(cnt)
@@ -87,7 +71,7 @@ func HomeSitemap(ctx *context.Context) {
 		}
 	}
 
-	_, cnt, err := repo_model.SearchRepository(ctx, &repo_model.SearchRepoOptions{
+	_, cnt, err := repo_model.SearchRepository(ctx, repo_model.SearchRepoOptions{
 		ListOptions: db.ListOptions{
 			PageSize: 1,
 		},
@@ -95,7 +79,7 @@ func HomeSitemap(ctx *context.Context) {
 		AllPublic: true,
 	})
 	if err != nil {
-		ctx.ServerError("SearchRepository", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 	count := int(cnt)
@@ -109,10 +93,4 @@ func HomeSitemap(ctx *context.Context) {
 	if _, err := m.WriteTo(ctx.Resp); err != nil {
 		log.Error("Failed writing sitemap: %v", err)
 	}
-}
-
-// NotFound render 404 page
-func NotFound(ctx *context.Context) {
-	ctx.Data["Title"] = "Page Not Found"
-	ctx.NotFound("home.NotFound", nil)
 }

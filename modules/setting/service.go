@@ -4,12 +4,13 @@
 package setting
 
 import (
-	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/structs"
+	"gitea.dev/modules/glob"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/structs"
 )
 
 // enumerates all the types of captchas
@@ -23,27 +24,28 @@ const (
 
 // Service settings
 var Service = struct {
-	DefaultUserVisibility                   string
-	DefaultUserVisibilityMode               structs.VisibleType
-	AllowedUserVisibilityModes              []string
-	AllowedUserVisibilityModesSlice         AllowedVisibility `ini:"-"`
-	DefaultOrgVisibility                    string
-	DefaultOrgVisibilityMode                structs.VisibleType
+	DefaultUserVisibilityMode               structs.VisibleType `ini:"-"`
+	AllowedUserVisibilityModesSlice         AllowedVisibility   `ini:"-"`
+	DefaultOrgVisibilityMode                structs.VisibleType `ini:"-"`
 	ActiveCodeLives                         int
 	ResetPwdCodeLives                       int
 	RegisterEmailConfirm                    bool
 	RegisterManualConfirm                   bool
-	EmailDomainWhitelist                    []string
-	EmailDomainBlocklist                    []string
+	EmailDomainAllowList                    []glob.Glob
+	EmailDomainBlockList                    []glob.Glob
 	DisableRegistration                     bool
 	AllowOnlyInternalRegistration           bool
 	AllowOnlyExternalRegistration           bool
 	ShowRegistrationButton                  bool
+	EnablePasswordSignInForm                bool
 	ShowMilestonesDashboardPage             bool
-	RequireSignInView                       bool
+	RequireSignInViewStrict                 bool
+	BlockAnonymousAccessExpensive           bool
 	EnableNotifyMail                        bool
 	EnableBasicAuth                         bool
+	EnablePasskeyAuth                       bool
 	EnableReverseProxyAuth                  bool
+	EnableReverseProxyAuthAPI               bool
 	EnableReverseProxyAutoRegister          bool
 	EnableReverseProxyEmail                 bool
 	EnableReverseProxyFullName              bool
@@ -63,6 +65,7 @@ var Service = struct {
 	McaptchaSitekey                         string
 	McaptchaURL                             string
 	DefaultKeepEmailPrivate                 bool
+	ForceUserActivityVisibility             string
 	DefaultAllowCreateOrganization          bool
 	DefaultUserIsRestricted                 bool
 	EnableTimetracking                      bool
@@ -71,6 +74,7 @@ var Service = struct {
 	AllowCrossRepositoryDependencies        bool
 	DefaultAllowOnlyContributorsToTrackTime bool
 	NoReplyAddress                          string
+	UserLocationMapURL                      string
 	EnableUserHeatmap                       bool
 	AutoWatchNewRepos                       bool
 	AutoWatchOnChanges                      bool
@@ -78,17 +82,20 @@ var Service = struct {
 	UserDeleteWithCommentsMaxTime           time.Duration
 	ValidSiteURLSchemes                     []string
 
-	// OpenID settings
-	EnableOpenIDSignIn bool
-	EnableOpenIDSignUp bool
-	OpenIDWhitelist    []*regexp.Regexp
-	OpenIDBlacklist    []*regexp.Regexp
-
 	// Explore page settings
 	Explore struct {
-		RequireSigninView bool `ini:"REQUIRE_SIGNIN_VIEW"`
-		DisableUsersPage  bool `ini:"DISABLE_USERS_PAGE"`
+		RequireSigninView        bool `ini:"REQUIRE_SIGNIN_VIEW"`
+		DisableUsersPage         bool `ini:"DISABLE_USERS_PAGE"`
+		DisableOrganizationsPage bool `ini:"DISABLE_ORGANIZATIONS_PAGE"`
+		DisableCodePage          bool `ini:"DISABLE_CODE_PAGE"`
 	} `ini:"service.explore"`
+
+	QoS struct {
+		Enabled             bool
+		MaxInFlightRequests int
+		MaxWaitingRequests  int
+		TargetWaitTime      time.Duration
+	}
 }{
 	AllowedUserVisibilityModesSlice: []bool{true, true, true},
 }
@@ -114,11 +121,25 @@ func (a AllowedVisibility) ToVisibleTypeSlice() (result []structs.VisibleType) {
 	return result
 }
 
+func CompileEmailGlobList(sec ConfigSection, keys ...string) (globs []glob.Glob) {
+	for _, key := range keys {
+		list := sec.Key(key).Strings(",")
+		for _, s := range list {
+			if g, err := glob.Compile(s); err == nil {
+				globs = append(globs, g)
+			} else {
+				log.Error("Skip invalid email allow/block list expression %q: %v", s, err)
+			}
+		}
+	}
+	return globs
+}
+
 func loadServiceFrom(rootCfg ConfigProvider) {
 	sec := rootCfg.Section("service")
 	Service.ActiveCodeLives = sec.Key("ACTIVE_CODE_LIVE_MINUTES").MustInt(180)
 	Service.ResetPwdCodeLives = sec.Key("RESET_PASSWD_CODE_LIVE_MINUTES").MustInt(180)
-	Service.DisableRegistration = sec.Key("DISABLE_REGISTRATION").MustBool()
+	Service.DisableRegistration = sec.Key("DISABLE_REGISTRATION").MustBool(true)
 	Service.AllowOnlyInternalRegistration = sec.Key("ALLOW_ONLY_INTERNAL_REGISTRATION").MustBool()
 	Service.AllowOnlyExternalRegistration = sec.Key("ALLOW_ONLY_EXTERNAL_REGISTRATION").MustBool()
 	if Service.AllowOnlyExternalRegistration && Service.AllowOnlyInternalRegistration {
@@ -130,13 +151,30 @@ func loadServiceFrom(rootCfg ConfigProvider) {
 	} else {
 		Service.RegisterManualConfirm = false
 	}
-	Service.EmailDomainWhitelist = sec.Key("EMAIL_DOMAIN_WHITELIST").Strings(",")
-	Service.EmailDomainBlocklist = sec.Key("EMAIL_DOMAIN_BLOCKLIST").Strings(",")
+	if sec.HasKey("EMAIL_DOMAIN_WHITELIST") {
+		deprecatedSetting(rootCfg, "service", "EMAIL_DOMAIN_WHITELIST", "service", "EMAIL_DOMAIN_ALLOWLIST")
+	}
+	Service.EmailDomainAllowList = CompileEmailGlobList(sec, "EMAIL_DOMAIN_WHITELIST", "EMAIL_DOMAIN_ALLOWLIST")
+	Service.EmailDomainBlockList = CompileEmailGlobList(sec, "EMAIL_DOMAIN_BLOCKLIST")
 	Service.ShowRegistrationButton = sec.Key("SHOW_REGISTRATION_BUTTON").MustBool(!(Service.DisableRegistration || Service.AllowOnlyExternalRegistration))
 	Service.ShowMilestonesDashboardPage = sec.Key("SHOW_MILESTONES_DASHBOARD_PAGE").MustBool(true)
-	Service.RequireSignInView = sec.Key("REQUIRE_SIGNIN_VIEW").MustBool()
+
+	// boolean values are considered as "strict"
+	var err error
+	Service.RequireSignInViewStrict, err = sec.Key("REQUIRE_SIGNIN_VIEW").Bool()
+	if s := sec.Key("REQUIRE_SIGNIN_VIEW").String(); err != nil && s != "" {
+		// non-boolean value only supports "expensive" at the moment
+		Service.BlockAnonymousAccessExpensive = s == "expensive"
+		if !Service.BlockAnonymousAccessExpensive {
+			log.Fatal("Invalid config option: REQUIRE_SIGNIN_VIEW = %s", s)
+		}
+	}
+
 	Service.EnableBasicAuth = sec.Key("ENABLE_BASIC_AUTHENTICATION").MustBool(true)
+	Service.EnablePasswordSignInForm = sec.Key("ENABLE_PASSWORD_SIGNIN_FORM").MustBool(true)
+	Service.EnablePasskeyAuth = sec.Key("ENABLE_PASSKEY_AUTHENTICATION").MustBool(true)
 	Service.EnableReverseProxyAuth = sec.Key("ENABLE_REVERSE_PROXY_AUTHENTICATION").MustBool()
+	Service.EnableReverseProxyAuthAPI = sec.Key("ENABLE_REVERSE_PROXY_AUTHENTICATION_API").MustBool()
 	Service.EnableReverseProxyAutoRegister = sec.Key("ENABLE_REVERSE_PROXY_AUTO_REGISTRATION").MustBool()
 	Service.EnableReverseProxyEmail = sec.Key("ENABLE_REVERSE_PROXY_EMAIL").MustBool()
 	Service.EnableReverseProxyFullName = sec.Key("ENABLE_REVERSE_PROXY_FULL_NAME").MustBool()
@@ -156,6 +194,7 @@ func loadServiceFrom(rootCfg ConfigProvider) {
 	Service.McaptchaSecret = sec.Key("MCAPTCHA_SECRET").MustString("")
 	Service.McaptchaSitekey = sec.Key("MCAPTCHA_SITEKEY").MustString("")
 	Service.DefaultKeepEmailPrivate = sec.Key("DEFAULT_KEEP_EMAIL_PRIVATE").MustBool()
+	Service.ForceUserActivityVisibility = sec.Key("FORCE_USER_ACTIVITY_VISIBILITY").In("", []string{"public", "private"})
 	Service.DefaultAllowCreateOrganization = sec.Key("DEFAULT_ALLOW_CREATE_ORGANIZATION").MustBool(true)
 	Service.DefaultUserIsRestricted = sec.Key("DEFAULT_USER_IS_RESTRICTED").MustBool(false)
 	Service.EnableTimetracking = sec.Key("ENABLE_TIMETRACKING").MustBool(true)
@@ -165,26 +204,44 @@ func loadServiceFrom(rootCfg ConfigProvider) {
 	Service.DefaultEnableDependencies = sec.Key("DEFAULT_ENABLE_DEPENDENCIES").MustBool(true)
 	Service.AllowCrossRepositoryDependencies = sec.Key("ALLOW_CROSS_REPOSITORY_DEPENDENCIES").MustBool(true)
 	Service.DefaultAllowOnlyContributorsToTrackTime = sec.Key("DEFAULT_ALLOW_ONLY_CONTRIBUTORS_TO_TRACK_TIME").MustBool(true)
-	Service.NoReplyAddress = sec.Key("NO_REPLY_ADDRESS").MustString("noreply." + Domain)
+	Service.NoReplyAddress = sec.Key("NO_REPLY_ADDRESS").MustString("noreply." + AppDomain)
+	Service.UserLocationMapURL = sec.Key("USER_LOCATION_MAP_URL").String()
 	Service.EnableUserHeatmap = sec.Key("ENABLE_USER_HEATMAP").MustBool(true)
 	Service.AutoWatchNewRepos = sec.Key("AUTO_WATCH_NEW_REPOS").MustBool(true)
 	Service.AutoWatchOnChanges = sec.Key("AUTO_WATCH_ON_CHANGES").MustBool(false)
-	Service.DefaultUserVisibility = sec.Key("DEFAULT_USER_VISIBILITY").In("public", structs.ExtractKeysFromMapString(structs.VisibilityModes))
-	Service.DefaultUserVisibilityMode = structs.VisibilityModes[Service.DefaultUserVisibility]
-	Service.AllowedUserVisibilityModes = sec.Key("ALLOWED_USER_VISIBILITY_MODES").Strings(",")
-	if len(Service.AllowedUserVisibilityModes) != 0 {
-		Service.AllowedUserVisibilityModesSlice = []bool{false, false, false}
-		for _, sMode := range Service.AllowedUserVisibilityModes {
-			Service.AllowedUserVisibilityModesSlice[structs.VisibilityModes[sMode]] = true
+
+	Service.AllowedUserVisibilityModesSlice = AllowedVisibility{false, false, false}
+	var allowedUserVisibilityModes []structs.VisibilityString
+	for _, allowedMode := range sec.Key("ALLOWED_USER_VISIBILITY_MODES").Strings(",") {
+		if tp, ok := structs.VisibilityModes[structs.VisibilityString(allowedMode)]; ok { // remove unsupported modes
+			allowedUserVisibilityModes = append(allowedUserVisibilityModes, structs.VisibilityString(allowedMode))
+			Service.AllowedUserVisibilityModesSlice[tp] = true
+		} else {
+			log.Warn("ALLOWED_USER_VISIBILITY_MODES %s is unsupported", allowedMode)
 		}
 	}
-	Service.DefaultOrgVisibility = sec.Key("DEFAULT_ORG_VISIBILITY").In("public", structs.ExtractKeysFromMapString(structs.VisibilityModes))
-	Service.DefaultOrgVisibilityMode = structs.VisibilityModes[Service.DefaultOrgVisibility]
+	if len(allowedUserVisibilityModes) == 0 {
+		allowedUserVisibilityModes = []structs.VisibilityString{structs.VisibilityStringPublic, structs.VisibilityStringLimited, structs.VisibilityStringPrivate}
+		Service.AllowedUserVisibilityModesSlice = AllowedVisibility{true, true, true}
+	}
+
+	defaultUserVisibility := structs.VisibilityString(sec.Key("DEFAULT_USER_VISIBILITY").String())
+	if defaultUserVisibility == "" {
+		defaultUserVisibility = allowedUserVisibilityModes[0]
+	} else if vt, ok := structs.VisibilityModes[defaultUserVisibility]; !ok || !Service.AllowedUserVisibilityModesSlice[vt] {
+		log.Warn("DEFAULT_USER_VISIBILITY %s is wrong or not in ALLOWED_USER_VISIBILITY_MODES, using first allowed", defaultUserVisibility)
+		defaultUserVisibility = allowedUserVisibilityModes[0]
+	}
+	Service.DefaultUserVisibilityMode = structs.VisibilityModes[defaultUserVisibility]
+
+	defaultOrgVisibility := structs.VisibilityString(sec.Key("DEFAULT_ORG_VISIBILITY").In("public", structs.VisibilityModeKeys()))
+	Service.DefaultOrgVisibilityMode = structs.VisibilityModes[defaultOrgVisibility]
 	Service.DefaultOrgMemberVisible = sec.Key("DEFAULT_ORG_MEMBER_VISIBLE").MustBool()
+
 	Service.UserDeleteWithCommentsMaxTime = sec.Key("USER_DELETE_WITH_COMMENTS_MAX_TIME").MustDuration(0)
-	sec.Key("VALID_SITE_URL_SCHEMES").MustString("http,https")
+	sec.Key("VALID_SITE_URL_SCHEMES").MustString("http,https") // FIXME: INI-MUST-SIDE-EFFECT
 	Service.ValidSiteURLSchemes = sec.Key("VALID_SITE_URL_SCHEMES").Strings(",")
-	schemes := make([]string, len(Service.ValidSiteURLSchemes))
+	schemes := make([]string, 0, len(Service.ValidSiteURLSchemes))
 	for _, scheme := range Service.ValidSiteURLSchemes {
 		scheme = strings.ToLower(strings.TrimSpace(scheme))
 		if scheme != "" {
@@ -195,25 +252,13 @@ func loadServiceFrom(rootCfg ConfigProvider) {
 
 	mustMapSetting(rootCfg, "service.explore", &Service.Explore)
 
-	loadOpenIDSetting(rootCfg)
+	loadQosSetting(rootCfg)
 }
 
-func loadOpenIDSetting(rootCfg ConfigProvider) {
-	sec := rootCfg.Section("openid")
-	Service.EnableOpenIDSignIn = sec.Key("ENABLE_OPENID_SIGNIN").MustBool(!InstallLock)
-	Service.EnableOpenIDSignUp = sec.Key("ENABLE_OPENID_SIGNUP").MustBool(!Service.DisableRegistration && Service.EnableOpenIDSignIn)
-	pats := sec.Key("WHITELISTED_URIS").Strings(" ")
-	if len(pats) != 0 {
-		Service.OpenIDWhitelist = make([]*regexp.Regexp, len(pats))
-		for i, p := range pats {
-			Service.OpenIDWhitelist[i] = regexp.MustCompilePOSIX(p)
-		}
-	}
-	pats = sec.Key("BLACKLISTED_URIS").Strings(" ")
-	if len(pats) != 0 {
-		Service.OpenIDBlacklist = make([]*regexp.Regexp, len(pats))
-		for i, p := range pats {
-			Service.OpenIDBlacklist[i] = regexp.MustCompilePOSIX(p)
-		}
-	}
+func loadQosSetting(rootCfg ConfigProvider) {
+	sec := rootCfg.Section("qos")
+	Service.QoS.Enabled = sec.Key("ENABLED").MustBool(false)
+	Service.QoS.MaxInFlightRequests = sec.Key("MAX_INFLIGHT").MustInt(4 * runtime.NumCPU())
+	Service.QoS.MaxWaitingRequests = sec.Key("MAX_WAITING").MustInt(100)
+	Service.QoS.TargetWaitTime = sec.Key("TARGET_WAIT_TIME").MustDuration(250 * time.Millisecond)
 }

@@ -6,7 +6,9 @@ package system
 import (
 	"context"
 
-	"code.gitea.io/gitea/models/db"
+	"gitea.dev/models/db"
+
+	"xorm.io/builder"
 )
 
 // AppState represents a state record in database
@@ -23,8 +25,8 @@ func init() {
 }
 
 // SaveAppStateContent saves the app state item to database
-func SaveAppStateContent(key, content string) error {
-	return db.WithTx(db.DefaultContext, func(ctx context.Context) error {
+func SaveAppStateContent(ctx context.Context, key, content string) error {
+	return db.WithTx(ctx, func(ctx context.Context) error {
 		eng := db.GetEngine(ctx)
 		// try to update existing row
 		res, err := eng.Exec("UPDATE app_state SET revision=revision+1, content=? WHERE id=?", content, key)
@@ -43,10 +45,8 @@ func SaveAppStateContent(key, content string) error {
 }
 
 // GetAppStateContent gets an app state from database
-func GetAppStateContent(key string) (content string, err error) {
-	e := db.GetEngine(db.DefaultContext)
-	appState := &AppState{ID: key}
-	has, err := e.Get(appState)
+func GetAppStateContent(ctx context.Context, key string) (content string, err error) {
+	appState, has, err := db.Get[AppState](ctx, builder.Eq{"id": key})
 	if err != nil {
 		return "", err
 	} else if !has {

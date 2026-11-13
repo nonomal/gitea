@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/packages"
-	user_model "code.gitea.io/gitea/models/user"
-	container_module "code.gitea.io/gitea/modules/packages/container"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	"gitea.dev/models/packages"
+	user_model "gitea.dev/models/user"
+	container_module "gitea.dev/modules/packages/container"
+	"gitea.dev/modules/util"
 
 	"xorm.io/builder"
 )
@@ -25,6 +25,7 @@ type BlobSearchOptions struct {
 	Digest     string
 	Tag        string
 	IsManifest bool
+	OnlyLead   bool
 	Repository string
 }
 
@@ -43,7 +44,10 @@ func (opts *BlobSearchOptions) toConds() builder.Cond {
 		cond = cond.And(builder.Eq{"package_version.lower_version": strings.ToLower(opts.Tag)})
 	}
 	if opts.IsManifest {
-		cond = cond.And(builder.Eq{"package_file.lower_name": ManifestFilename})
+		cond = cond.And(builder.Eq{"package_file.lower_name": container_module.ManifestFilename})
+	}
+	if opts.OnlyLead {
+		cond = cond.And(builder.Eq{"package_file.is_lead": true})
 	}
 	if opts.Digest != "" {
 		var propsCond builder.Cond = builder.Eq{
@@ -73,11 +77,9 @@ func GetContainerBlob(ctx context.Context, opts *BlobSearchOptions) (*packages.P
 	pfds, err := getContainerBlobsLimit(ctx, opts, 1)
 	if err != nil {
 		return nil, err
-	}
-	if len(pfds) != 1 {
+	} else if len(pfds) == 0 {
 		return nil, ErrContainerBlobNotExist
 	}
-
 	return pfds[0], nil
 }
 
@@ -101,16 +103,7 @@ func getContainerBlobsLimit(ctx context.Context, opts *BlobSearchOptions, limit 
 		return nil, err
 	}
 
-	pfds := make([]*packages.PackageFileDescriptor, 0, len(pfs))
-	for _, pf := range pfs {
-		pfd, err := packages.GetPackageFileDescriptor(ctx, pf)
-		if err != nil {
-			return nil, err
-		}
-		pfds = append(pfds, pfd)
-	}
-
-	return pfds, nil
+	return packages.GetPackageFileDescriptors(ctx, pfs)
 }
 
 // GetManifestVersions gets all package versions representing the matching manifest
@@ -216,6 +209,9 @@ func (opts *ImageTagsSearchOptions) configureOrderBy(e db.Engine) {
 	default:
 		e.Desc("package_version.created_unix")
 	}
+
+	// Sort by id for stable order with duplicates in the other field
+	e.Asc("package_version.id")
 }
 
 // SearchImageTags gets a sorted list of the tags of an image
@@ -227,7 +223,7 @@ func SearchImageTags(ctx context.Context, opts *ImageTagsSearchOptions) ([]*pack
 	opts.configureOrderBy(sess)
 
 	if opts.Paginator != nil {
-		sess = db.SetSessionPagination(sess, opts)
+		db.SetSessionPagination(sess, opts)
 	}
 
 	pvs := make([]*packages.PackageVersion, 0, 10)
@@ -239,7 +235,7 @@ func SearchImageTags(ctx context.Context, opts *ImageTagsSearchOptions) ([]*pack
 func SearchExpiredUploadedBlobs(ctx context.Context, olderThan time.Duration) ([]*packages.PackageFile, error) {
 	var cond builder.Cond = builder.Eq{
 		"package_version.is_internal":   true,
-		"package_version.lower_version": UploadVersion,
+		"package_version.lower_version": container_module.UploadVersion,
 		"package.type":                  packages.TypeContainer,
 	}
 	cond = cond.And(builder.Lt{"package_file.created_unix": time.Now().Add(-olderThan).Unix()})
@@ -269,6 +265,10 @@ func GetRepositories(ctx context.Context, actor *user_model.User, n int, last st
 
 	if last != "" {
 		cond = cond.And(builder.Gt{"package_property.value": strings.ToLower(last)})
+	}
+
+	if actor.IsGhost() {
+		actor = nil
 	}
 
 	cond = cond.And(user_model.BuildCanSeeUserCondition(actor))

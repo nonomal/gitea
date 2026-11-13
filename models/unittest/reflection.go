@@ -4,17 +4,17 @@
 package unittest
 
 import (
-	"log"
+	"fmt"
 	"reflect"
 )
 
 func fieldByName(v reflect.Value, field string) reflect.Value {
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 	f := v.FieldByName(field)
 	if !f.IsValid() {
-		log.Panicf("can not read %s for %v", field, v)
+		panic(fmt.Errorf("can not read %s for %v", field, v))
 	}
 	return f
 }
@@ -23,7 +23,7 @@ type reflectionValue struct {
 	v reflect.Value
 }
 
-func reflectionWrap(v interface{}) *reflectionValue {
+func reflectionWrap(v any) *reflectionValue {
 	return &reflectionValue{v: reflect.ValueOf(v)}
 }
 

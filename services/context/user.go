@@ -4,79 +4,72 @@
 package context
 
 import (
+	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/context"
+	"gitea.dev/models/organization"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/session"
+	"gitea.dev/modules/util"
 )
 
-// UserAssignmentWeb returns a middleware to handle context-user assignment for web routes
-func UserAssignmentWeb() func(ctx *context.Context) {
-	return func(ctx *context.Context) {
-		userAssignment(ctx, func(status int, title string, obj interface{}) {
-			err, ok := obj.(error)
-			if !ok {
-				err = fmt.Errorf("%s", obj)
-			}
-			if status == http.StatusNotFound {
-				ctx.NotFound(title, err)
-			} else {
-				ctx.ServerError(title, err)
-			}
-		})
+func ReqContextUserVisibleToDoer() func(ctx *Context) {
+	return func(ctx *Context) {
+		isOrg := ctx.ContextUser.IsOrganization()
+		if isOrg && !organization.HasOrgOrUserVisible(ctx, ctx.ContextUser, ctx.Doer) ||
+			!isOrg && !user_model.IsUserVisibleToViewer(ctx, ctx.ContextUser, ctx.Doer) {
+			ctx.NotFound()
+			return
+		}
 	}
 }
 
-// UserIDAssignmentAPI returns a middleware to handle context-user assignment for api routes
-func UserIDAssignmentAPI() func(ctx *context.APIContext) {
-	return func(ctx *context.APIContext) {
-		userID := ctx.ParamsInt64(":user-id")
-
-		if ctx.IsSigned && ctx.Doer.ID == userID {
-			ctx.ContextUser = ctx.Doer
-		} else {
-			var err error
-			ctx.ContextUser, err = user_model.GetUserByID(ctx, userID)
-			if err != nil {
-				if user_model.IsErrUserNotExist(err) {
-					ctx.Error(http.StatusNotFound, "GetUserByID", err)
-				} else {
-					ctx.Error(http.StatusInternalServerError, "GetUserByID", err)
-				}
-			}
-		}
+// UserAssignmentWeb returns a middleware to handle context-user assignment for web routes
+func UserAssignmentWeb() func(ctx *Context) {
+	return func(ctx *Context) {
+		ctx.ContextUser = userAssignment(ctx.Base, ctx.Doer, ctx.ServerErrorAuto)
+		ctx.Data["ContextUser"] = ctx.ContextUser
 	}
 }
 
 // UserAssignmentAPI returns a middleware to handle context-user assignment for api routes
-func UserAssignmentAPI() func(ctx *context.APIContext) {
-	return func(ctx *context.APIContext) {
-		userAssignment(ctx.Context, ctx.Error)
+func UserAssignmentAPI() func(ctx *APIContext) {
+	return func(ctx *APIContext) {
+		ctx.ContextUser = userAssignment(ctx.Base, ctx.Doer, ctx.APIErrorAuto)
 	}
 }
 
-func userAssignment(ctx *context.Context, errCb func(int, string, interface{})) {
-	username := ctx.Params(":username")
+func userAssignment(ctx *Base, doer *user_model.User, errCb func(error)) (contextUser *user_model.User) {
+	username := ctx.PathParam("username")
 
-	if ctx.IsSigned && ctx.Doer.LowerName == strings.ToLower(username) {
-		ctx.ContextUser = ctx.Doer
+	if doer != nil && strings.EqualFold(doer.LowerName, username) {
+		contextUser = doer
 	} else {
 		var err error
-		ctx.ContextUser, err = user_model.GetUserByName(ctx, username)
+		contextUser, err = user_model.GetUserByName(ctx, username)
 		if err != nil {
-			if user_model.IsErrUserNotExist(err) {
-				if redirectUserID, err := user_model.LookupUserRedirect(username); err == nil {
-					context.RedirectToUser(ctx, username, redirectUserID)
-				} else if user_model.IsErrUserRedirectNotExist(err) {
-					errCb(http.StatusNotFound, "GetUserByName", err)
+			if errors.Is(err, util.ErrNotExist) {
+				if redirectUserID, err := user_model.LookupUserRedirect(ctx, username); err == nil {
+					RedirectToUser(ctx, doer, username, redirectUserID)
+				} else if errors.Is(err, util.ErrNotExist) {
+					errCb(util.NewNotExistErrorf("user not found"))
 				} else {
-					errCb(http.StatusInternalServerError, "LookupUserRedirect", err)
+					errCb(fmt.Errorf("LookupUserRedirect: %w", err))
 				}
 			} else {
-				errCb(http.StatusInternalServerError, "GetUserByName", err)
+				errCb(fmt.Errorf("GetUserByName: %w", err))
 			}
+			return nil
 		}
 	}
+	if !user_model.DoerTokenAllowsOwner(doer, contextUser) {
+		errCb(util.NewNotExistErrorf("user not found"))
+		return nil
+	}
+	return contextUser
+}
+
+func IsDoerSessionImpersonated(sess session.Store) bool {
+	return sess.Get(session.KeyImpersonatorData) != nil
 }

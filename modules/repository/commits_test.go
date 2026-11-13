@@ -4,17 +4,13 @@
 package repository
 
 import (
-	"crypto/md5"
-	"fmt"
 	"testing"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	system_model "code.gitea.io/gitea/models/system"
-	"code.gitea.io/gitea/models/unittest"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/setting"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/git"
+	api "gitea.dev/modules/structs"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -52,98 +48,32 @@ func TestPushCommits_ToAPIPayloadCommits(t *testing.T) {
 	pushCommits.HeadCommit = &PushCommit{Sha1: "69554a6"}
 
 	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 16})
-	payloadCommits, headCommit, err := pushCommits.ToAPIPayloadCommits(git.DefaultContext, repo.RepoPath(), "/user2/repo16")
+	payloadCommits, headCommit, err := pushCommits.ToAPIPayloadCommits(t.Context(), repo)
 	assert.NoError(t, err)
 	assert.Len(t, payloadCommits, 3)
 	assert.NotNil(t, headCommit)
 
-	assert.Equal(t, "69554a6", payloadCommits[0].ID)
-	assert.Equal(t, "not signed commit", payloadCommits[0].Message)
-	assert.Equal(t, "/user2/repo16/commit/69554a6", payloadCommits[0].URL)
-	assert.Equal(t, "User2", payloadCommits[0].Committer.Name)
-	assert.Equal(t, "user2", payloadCommits[0].Committer.UserName)
-	assert.Equal(t, "User2", payloadCommits[0].Author.Name)
-	assert.Equal(t, "user2", payloadCommits[0].Author.UserName)
-	assert.EqualValues(t, []string{}, payloadCommits[0].Added)
-	assert.EqualValues(t, []string{}, payloadCommits[0].Removed)
-	assert.EqualValues(t, []string{"readme.md"}, payloadCommits[0].Modified)
-
-	assert.Equal(t, "27566bd", payloadCommits[1].ID)
-	assert.Equal(t, "good signed commit (with not yet validated email)", payloadCommits[1].Message)
-	assert.Equal(t, "/user2/repo16/commit/27566bd", payloadCommits[1].URL)
-	assert.Equal(t, "User2", payloadCommits[1].Committer.Name)
-	assert.Equal(t, "user2", payloadCommits[1].Committer.UserName)
-	assert.Equal(t, "User2", payloadCommits[1].Author.Name)
-	assert.Equal(t, "user2", payloadCommits[1].Author.UserName)
-	assert.EqualValues(t, []string{}, payloadCommits[1].Added)
-	assert.EqualValues(t, []string{}, payloadCommits[1].Removed)
-	assert.EqualValues(t, []string{"readme.md"}, payloadCommits[1].Modified)
-
-	assert.Equal(t, "5099b81", payloadCommits[2].ID)
-	assert.Equal(t, "good signed commit", payloadCommits[2].Message)
-	assert.Equal(t, "/user2/repo16/commit/5099b81", payloadCommits[2].URL)
-	assert.Equal(t, "User2", payloadCommits[2].Committer.Name)
-	assert.Equal(t, "user2", payloadCommits[2].Committer.UserName)
-	assert.Equal(t, "User2", payloadCommits[2].Author.Name)
-	assert.Equal(t, "user2", payloadCommits[2].Author.UserName)
-	assert.EqualValues(t, []string{"readme.md"}, payloadCommits[2].Added)
-	assert.EqualValues(t, []string{}, payloadCommits[2].Removed)
-	assert.EqualValues(t, []string{}, payloadCommits[2].Modified)
-
-	assert.Equal(t, "69554a6", headCommit.ID)
-	assert.Equal(t, "not signed commit", headCommit.Message)
-	assert.Equal(t, "/user2/repo16/commit/69554a6", headCommit.URL)
-	assert.Equal(t, "User2", headCommit.Committer.Name)
-	assert.Equal(t, "user2", headCommit.Committer.UserName)
-	assert.Equal(t, "User2", headCommit.Author.Name)
-	assert.Equal(t, "user2", headCommit.Author.UserName)
-	assert.EqualValues(t, []string{}, headCommit.Added)
-	assert.EqualValues(t, []string{}, headCommit.Removed)
-	assert.EqualValues(t, []string{"readme.md"}, headCommit.Modified)
-}
-
-func enableGravatar(t *testing.T) {
-	err := system_model.SetSettingNoVersion(db.DefaultContext, system_model.KeyPictureDisableGravatar, "false")
-	assert.NoError(t, err)
-	setting.GravatarSource = "https://secure.gravatar.com/avatar"
-	err = system_model.Init(db.DefaultContext)
-	assert.NoError(t, err)
-}
-
-func TestPushCommits_AvatarLink(t *testing.T) {
-	assert.NoError(t, unittest.PrepareTestDatabase())
-
-	pushCommits := NewPushCommits()
-	pushCommits.Commits = []*PushCommit{
-		{
-			Sha1:           "abcdef1",
-			CommitterEmail: "user2@example.com",
-			CommitterName:  "User Two",
-			AuthorEmail:    "user4@example.com",
-			AuthorName:     "User Four",
-			Message:        "message1",
-		},
-		{
-			Sha1:           "abcdef2",
-			CommitterEmail: "user2@example.com",
-			CommitterName:  "User Two",
-			AuthorEmail:    "user2@example.com",
-			AuthorName:     "User Two",
-			Message:        "message2",
-		},
+	for _, tt := range []struct {
+		commit           *api.PayloadCommit
+		id, message, url string
+		added, modified  []string
+	}{
+		{payloadCommits[0], "69554a6", "not signed commit", "https://try.gitea.io/user2/repo16/commit/69554a6", []string{}, []string{"readme.md"}},
+		{payloadCommits[1], "27566bd", "good signed commit (with not yet validated email)", "https://try.gitea.io/user2/repo16/commit/27566bd", []string{}, []string{"readme.md"}},
+		{payloadCommits[2], "5099b81", "good signed commit", "https://try.gitea.io/user2/repo16/commit/5099b81", []string{"readme.md"}, []string{}},
+		{headCommit, "69554a6", "not signed commit", "https://try.gitea.io/user2/repo16/commit/69554a6", []string{}, []string{"readme.md"}},
+	} {
+		assert.Equal(t, tt.id, tt.commit.ID)
+		assert.Equal(t, tt.message, tt.commit.Message)
+		assert.Equal(t, tt.url, tt.commit.URL)
+		assert.Equal(t, "User2", tt.commit.Committer.Name)
+		assert.Equal(t, "user2", tt.commit.Committer.UserName)
+		assert.Equal(t, "User2", tt.commit.Author.Name)
+		assert.Equal(t, "user2", tt.commit.Author.UserName)
+		assert.Equal(t, tt.added, tt.commit.Added)
+		assert.Equal(t, []string{}, tt.commit.Removed)
+		assert.Equal(t, tt.modified, tt.commit.Modified)
 	}
-
-	enableGravatar(t)
-
-	assert.Equal(t,
-		"https://secure.gravatar.com/avatar/ab53a2911ddf9b4817ac01ddcd3d975f?d=identicon&s=84",
-		pushCommits.AvatarLink(db.DefaultContext, "user2@example.com"))
-
-	assert.Equal(t,
-		"https://secure.gravatar.com/avatar/"+
-			fmt.Sprintf("%x", md5.Sum([]byte("nonexistent@example.com")))+
-			"?d=identicon&s=84",
-		pushCommits.AvatarLink(db.DefaultContext, "nonexistent@example.com"))
 }
 
 func TestCommitToPushCommit(t *testing.T) {
@@ -160,7 +90,7 @@ func TestCommitToPushCommit(t *testing.T) {
 		ID:            sha1,
 		Author:        sig,
 		Committer:     sig,
-		CommitMessage: "Commit Message",
+		CommitMessage: git.CommitMessage{MessageRaw: "Commit Message"},
 	})
 	assert.Equal(t, hexString, pushCommit.Sha1)
 	assert.Equal(t, "Commit Message", pushCommit.Message)
@@ -191,13 +121,13 @@ func TestListToPushCommits(t *testing.T) {
 			ID:            hash1,
 			Author:        sig,
 			Committer:     sig,
-			CommitMessage: "Message1",
+			CommitMessage: git.CommitMessage{MessageRaw: "Message1"},
 		},
 		{
 			ID:            hash2,
 			Author:        sig,
 			Committer:     sig,
-			CommitMessage: "Message2",
+			CommitMessage: git.CommitMessage{MessageRaw: "Message2"},
 		},
 	}
 
@@ -214,5 +144,3 @@ func TestListToPushCommits(t *testing.T) {
 		assert.Equal(t, now, pushCommits.Commits[1].Timestamp)
 	}
 }
-
-// TODO TestPushUpdate

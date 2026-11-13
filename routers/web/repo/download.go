@@ -5,165 +5,149 @@
 package repo
 
 import (
-	"path"
 	"time"
 
-	git_model "code.gitea.io/gitea/models/git"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/httpcache"
-	"code.gitea.io/gitea/modules/lfs"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/storage"
-	"code.gitea.io/gitea/routers/common"
+	auth_model "gitea.dev/models/auth"
+	git_model "gitea.dev/models/git"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/httpcache"
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/lfs"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/storage"
+	"gitea.dev/routers/common"
+	"gitea.dev/services/context"
 )
 
+func checkDownloadTokenScope(ctx *context.Context) bool {
+	context.CheckRepoScopedToken(ctx, auth_model.Read)
+	return !ctx.Written()
+}
+
 // ServeBlobOrLFS download a git.Blob redirecting to LFS if necessary
-func ServeBlobOrLFS(ctx *context.Context, blob *git.Blob, lastModified time.Time) error {
-	if httpcache.HandleGenericETagTimeCache(ctx.Req, ctx.Resp, `"`+blob.ID.String()+`"`, lastModified) {
+func ServeBlobOrLFS(ctx *context.Context, blob *git.Blob, lastModified *time.Time) error {
+	if httpcache.HandleGenericETagPrivateCache(ctx.Req, ctx.Resp, `"`+blob.ID.String()+`"`, lastModified) {
 		return nil
 	}
 
-	dataRc, err := blob.DataAsync()
+	lfsPointerBuf, err := blob.GetBlobBytes(ctx, lfs.MetaFileMaxSize)
 	if err != nil {
 		return err
 	}
-	closed := false
-	defer func() {
-		if closed {
-			return
-		}
-		if err = dataRc.Close(); err != nil {
-			log.Error("ServeBlobOrLFS: Close: %v", err)
-		}
-	}()
 
-	pointer, _ := lfs.ReadPointer(dataRc)
+	pointer, _ := lfs.ReadPointerFromBuffer(lfsPointerBuf)
 	if pointer.IsValid() {
 		meta, _ := git_model.GetLFSMetaObjectByOid(ctx, ctx.Repo.Repository.ID, pointer.Oid)
 		if meta == nil {
-			if err = dataRc.Close(); err != nil {
-				log.Error("ServeBlobOrLFS: Close: %v", err)
-			}
-			closed = true
-			return common.ServeBlob(ctx, blob, lastModified)
+			return common.ServeBlob(ctx.Base, ctx.Repo.Repository, ctx.Repo.TreePath, blob, lastModified)
 		}
-		if httpcache.HandleGenericETagCache(ctx.Req, ctx.Resp, `"`+pointer.Oid+`"`) {
+		if httpcache.HandleGenericETagPrivateCache(ctx.Req, ctx.Resp, `"`+pointer.Oid+`"`, meta.UpdatedUnix.AsTimePtr()) {
 			return nil
 		}
 
-		if setting.LFS.ServeDirect {
-			// If we have a signed url (S3, object storage), redirect to this directly.
-			u, err := storage.LFS.URL(pointer.RelativePath(), blob.Name())
+		if setting.LFS.Storage.ServeDirect() {
+			// If we have a signed url (S3, object storage, blob storage), redirect to this directly.
+			u, err := storage.LFS.ServeDirectURL(pointer.RelativePath(), blob.Name(), ctx.Req.Method, nil)
 			if u != nil && err == nil {
 				ctx.Redirect(u.String())
 				return nil
 			}
 		}
 
-		lfsDataRc, err := lfs.ReadMetaObject(meta.Pointer)
+		lfsDataFile, err := lfs.ReadMetaObject(meta.Pointer)
 		if err != nil {
 			return err
 		}
-		defer func() {
-			if err = lfsDataRc.Close(); err != nil {
-				log.Error("ServeBlobOrLFS: Close: %v", err)
-			}
-		}()
-		return common.ServeData(ctx, ctx.Repo.TreePath, meta.Size, lfsDataRc)
+		defer lfsDataFile.Close()
+		httplib.ServeUserContentByFile(ctx.Req, ctx.Resp, lfsDataFile, httplib.ServeHeaderOptions{Filename: ctx.Repo.TreePath})
+		return nil
 	}
-	if err = dataRc.Close(); err != nil {
-		log.Error("ServeBlobOrLFS: Close: %v", err)
-	}
-	closed = true
 
-	return common.ServeBlob(ctx, blob, lastModified)
+	return common.ServeBlob(ctx.Base, ctx.Repo.Repository, ctx.Repo.TreePath, blob, lastModified)
 }
 
-func getBlobForEntry(ctx *context.Context) (blob *git.Blob, lastModified time.Time) {
-	entry, err := ctx.Repo.Commit.GetTreeEntryByPath(ctx.Repo.TreePath)
+func getBlobForEntry(ctx *context.Context) (*git.Blob, *time.Time) {
+	entry, err := ctx.Repo.Commit.GetTreeEntryByPath(ctx, ctx.Repo.GitRepo, ctx.Repo.TreePath)
 	if err != nil {
-		if git.IsErrNotExist(err) {
-			ctx.NotFound("GetTreeEntryByPath", err)
-		} else {
-			ctx.ServerError("GetTreeEntryByPath", err)
-		}
-		return
+		ctx.ServerErrorAuto(err)
+		return nil, nil
 	}
 
 	if entry.IsDir() || entry.IsSubModule() {
-		ctx.NotFound("getBlobForEntry", nil)
-		return
+		ctx.NotFound()
+		return nil, nil
 	}
 
-	info, _, err := git.Entries([]*git.TreeEntry{entry}).GetCommitsInfo(ctx, ctx.Repo.Commit, path.Dir("/" + ctx.Repo.TreePath)[1:])
+	latestCommit, err := ctx.Repo.GitRepo.GetTreePathLatestCommit(ctx, ctx.Repo.Commit.ID.String(), ctx.Repo.TreePath)
 	if err != nil {
-		ctx.ServerError("GetCommitsInfo", err)
-		return
+		ctx.ServerErrorAuto(err)
+		return nil, nil
 	}
+	lastModified := &latestCommit.Committer.When
 
-	if len(info) == 1 {
-		// Not Modified
-		lastModified = info[0].Commit.Committer.When
-	}
-	blob = entry.Blob()
-
-	return blob, lastModified
+	return entry.Blob(ctx.Repo.GitRepo), lastModified
 }
 
 // SingleDownload download a file by repos path
 func SingleDownload(ctx *context.Context) {
+	if !checkDownloadTokenScope(ctx) {
+		return
+	}
+
 	blob, lastModified := getBlobForEntry(ctx)
 	if blob == nil {
 		return
 	}
 
-	if err := common.ServeBlob(ctx, blob, lastModified); err != nil {
-		ctx.ServerError("ServeBlob", err)
+	if err := common.ServeBlob(ctx.Base, ctx.Repo.Repository, ctx.Repo.TreePath, blob, lastModified); err != nil {
+		ctx.ServerErrorAuto(err)
 	}
 }
 
 // SingleDownloadOrLFS download a file by repos path redirecting to LFS if necessary
 func SingleDownloadOrLFS(ctx *context.Context) {
+	if !checkDownloadTokenScope(ctx) {
+		return
+	}
+
 	blob, lastModified := getBlobForEntry(ctx)
 	if blob == nil {
 		return
 	}
 
 	if err := ServeBlobOrLFS(ctx, blob, lastModified); err != nil {
-		ctx.ServerError("ServeBlobOrLFS", err)
+		ctx.ServerErrorAuto(err)
 	}
 }
 
 // DownloadByID download a file by sha1 ID
 func DownloadByID(ctx *context.Context) {
-	blob, err := ctx.Repo.GitRepo.GetBlob(ctx.Params("sha"))
-	if err != nil {
-		if git.IsErrNotExist(err) {
-			ctx.NotFound("GetBlob", nil)
-		} else {
-			ctx.ServerError("GetBlob", err)
-		}
+	if !checkDownloadTokenScope(ctx) {
 		return
 	}
-	if err = common.ServeBlob(ctx, blob, time.Time{}); err != nil {
-		ctx.ServerError("ServeBlob", err)
+
+	blob, err := ctx.Repo.GitRepo.GetBlob(ctx.PathParam("sha"))
+	if err != nil {
+		ctx.ServerErrorAuto(err)
+		return
+	}
+	if err = common.ServeBlob(ctx.Base, ctx.Repo.Repository, ctx.Repo.TreePath, blob, nil); err != nil {
+		ctx.ServerErrorAuto(err)
 	}
 }
 
 // DownloadByIDOrLFS download a file by sha1 ID taking account of LFS
 func DownloadByIDOrLFS(ctx *context.Context) {
-	blob, err := ctx.Repo.GitRepo.GetBlob(ctx.Params("sha"))
-	if err != nil {
-		if git.IsErrNotExist(err) {
-			ctx.NotFound("GetBlob", nil)
-		} else {
-			ctx.ServerError("GetBlob", err)
-		}
+	if !checkDownloadTokenScope(ctx) {
 		return
 	}
-	if err = ServeBlobOrLFS(ctx, blob, time.Time{}); err != nil {
-		ctx.ServerError("ServeBlob", err)
+
+	blob, err := ctx.Repo.GitRepo.GetBlob(ctx.PathParam("sha"))
+	if err != nil {
+		ctx.ServerErrorAuto(err)
+		return
+	}
+	if err = ServeBlobOrLFS(ctx, blob, nil); err != nil {
+		ctx.ServerErrorAuto(err)
 	}
 }

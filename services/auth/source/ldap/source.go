@@ -6,24 +6,20 @@ package ldap
 import (
 	"strings"
 
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/secret"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/models/auth"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/secret"
+	"gitea.dev/modules/setting"
 )
 
-// .____     ________      _____ __________
-// |    |    \______ \    /  _  \\______   \
-// |    |     |    |  \  /  /_\  \|     ___/
-// |    |___  |    `   \/    |    \    |
-// |_______ \/_______  /\____|__  /____|
-//         \/        \/         \/
-
-// Package ldap provide functions & structure to query a LDAP ldap directory
+// Package ldap provide functions & structure to query an LDAP directory
 // For now, it's mainly tested again an MS Active Directory service, see README.md for more information
 
 // Source Basic LDAP authentication service
 type Source struct {
+	auth.ConfigBase `json:"-"`
+
 	Name                  string // canonical name (ie. corporate.ad)
 	Host                  string // LDAP host
 	Port                  int    // port number
@@ -41,6 +37,7 @@ type Source struct {
 	AttributesInBind      bool   // fetch attributes in bind context (not user)
 	AttributeSSHPublicKey string // LDAP SSH Public Key attribute
 	AttributeAvatar       string
+	SSHKeysAreVerified    bool   // true if SSH keys in LDAP are verified
 	SearchPageSize        uint32 // Search with paging page size
 	Filter                string // Query filter to validate entry
 	AdminFilter           string // Query filter to check if user is admin
@@ -54,26 +51,20 @@ type Source struct {
 	GroupTeamMap          string // Map LDAP groups to teams
 	GroupTeamMapRemoval   bool   // Remove user from teams which are synchronized and user is not a member of the corresponding LDAP group
 	UserUID               string // User Attribute listed in Group
-	SkipLocalTwoFA        bool   `json:",omitempty"` // Skip Local 2fa for users authenticated with this source
-
-	// reference to the authSource
-	authSource *auth.Source
 }
 
-// FromDB fills up a LDAPConfig from serialized format.
-func (source *Source) FromDB(bs []byte) error {
-	err := json.UnmarshalHandleDoubleEncode(bs, &source)
-	if err != nil {
-		return err
-	}
+func (source *Source) FromDB(bs []byte) (err error) {
+	auth.UnmarshalAuthSourceConfig(bs, source)
 	if source.BindPasswordEncrypt != "" {
 		source.BindPassword, err = secret.DecryptSecret(setting.SecretKey, source.BindPasswordEncrypt)
+		if err != nil {
+			log.Error("Unable to decrypt bind password for LDAP source, maybe SECRET_KEY is wrong: %v", err)
+		}
 		source.BindPasswordEncrypt = ""
 	}
-	return err
+	return nil
 }
 
-// ToDB exports a LDAPConfig to a serialized format.
 func (source *Source) ToDB() ([]byte, error) {
 	var err error
 	source.BindPasswordEncrypt, err = secret.EncryptSecret(setting.SecretKey, source.BindPassword)
@@ -107,12 +98,7 @@ func (source *Source) UseTLS() bool {
 
 // ProvidesSSHKeys returns if this source provides SSH Keys
 func (source *Source) ProvidesSSHKeys() bool {
-	return len(strings.TrimSpace(source.AttributeSSHPublicKey)) > 0
-}
-
-// SetAuthSource sets the related AuthSource
-func (source *Source) SetAuthSource(authSource *auth.Source) {
-	source.authSource = authSource
+	return strings.TrimSpace(source.AttributeSSHPublicKey) != ""
 }
 
 func init() {

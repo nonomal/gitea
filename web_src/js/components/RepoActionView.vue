@@ -1,406 +1,382 @@
+<script setup lang="ts">
+import SvgIcon from './SvgIcon.vue';
+import ActionStatusIcon from './ActionStatusIcon.vue';
+import {computed, onBeforeUnmount, ref, toRefs, watch} from 'vue';
+import {resetActionFavicon, syncActionRunFavicon} from '../modules/favicon-status.ts';
+import {POST, DELETE} from '../modules/fetch.ts';
+import ActionRunSummaryView, {type ActionRunSummaryViewLocale} from './ActionRunSummaryView.vue';
+import ActionRunJobView, {type ActionRunJobViewLocale} from './ActionRunJobView.vue';
+import type {ActionsJob, ActionsRunAttempt} from '../modules/gitea-actions.ts';
+import {buildJobsByParentJobID, createActionRunViewStore} from './ActionRunView.ts';
+import {buildArtifactTooltipHtml} from './ActionRunArtifacts.ts';
+import {trString} from '../modules/i18n.ts';
+import {confirmModal} from '../features/comp/ConfirmModal.ts';
+
+defineOptions({
+  name: 'RepoActionView',
+});
+
+type RepoActionViewLocale = ActionRunSummaryViewLocale & ActionRunJobViewLocale & {
+  approve: string,
+  cancel: string,
+  rerun: string,
+  rerun_all: string,
+  rerun_failed: string,
+  latest: string,
+  latestAttempt: string,
+  attempt: string,
+  summary: string,
+  allJobs: string,
+  jobSummaries: string,
+  expandCallerJobs: string,
+  collapseCallerJobs: string,
+  backToPullRequest: string,
+  backToWorkflow: string,
+  artifactExpired: string,
+  artifactExpiresAt: string,
+  artifactExpiredAt: string,
+  confirmDeleteArtifact: string,
+  downloadFile: string,
+  workflowFile: string,
+  workflowFileNoPermission: string,
+  runDetails: string,
+};
+
+const props = defineProps<{
+  jobId: number;
+  actionsViewUrl: string;
+  locale: RepoActionViewLocale;
+}>();
+
+const locale = props.locale;
+const store = createActionRunViewStore(props.actionsViewUrl);
+const {currentRun: run, runArtifacts: artifacts} = toRefs(store.viewData);
+const visibleJobSummaries = computed(() => {
+  const summaries = run.value.jobSummaries || [];
+  if (!props.jobId) return summaries;
+  return summaries.filter((summary) => summary.jobId === props.jobId);
+});
+
+type JobListItem = {
+  job: ActionsJob;
+  depth: number;
+};
+
+// Caller jobs default to collapsed. Membership in this set means "user has manually expanded this caller"
+const expandedJobIDs = ref(new Set<number>());
+
+function toggleExpandedJob(jobID: number) {
+  const next = new Set(expandedJobIDs.value);
+  if (next.has(jobID)) {
+    next.delete(jobID);
+  } else {
+    next.add(jobID);
+  }
+  expandedJobIDs.value = next;
+}
+
+// When a child job is currently selected, force-expand the chain of caller ancestors
+const forcedExpandedJobIDs = computed(() => {
+  const expanded = new Set<number>();
+  if (!props.jobId) return expanded;
+  const jobsByID = new Map((run.value.jobs || []).map((job) => [job.id, job]));
+  let cur = jobsByID.get(props.jobId);
+  while (cur?.parentJobID) {
+    expanded.add(cur.parentJobID);
+    cur = jobsByID.get(cur.parentJobID);
+  }
+  return expanded;
+});
+
+function isJobCollapsed(jobID: number) {
+  return !expandedJobIDs.value.has(jobID) && !forcedExpandedJobIDs.value.has(jobID);
+}
+
+const visibleJobListItems = computed<JobListItem[]>(() => {
+  const jobs = (run.value.jobs || []).filter((job) => job.status !== 'pending' || job.id === props.jobId).sort((a, b) => a.id - b.id);
+  const childrenByParent = buildJobsByParentJobID(jobs);
+
+  const result: JobListItem[] = [];
+  const stack: Array<{job: ActionsJob; depth: number}> = [];
+  const top = childrenByParent.get(0) || [];
+  for (let i = top.length - 1; i >= 0; i--) stack.push({job: top[i], depth: 0});
+
+  while (stack.length > 0) {
+    const {job, depth} = stack.pop()!;
+    const children = childrenByParent.get(job.id) || [];
+    result.push({job, depth});
+    if (children.length > 0 && isJobCollapsed(job.id)) continue;
+    for (let i = children.length - 1; i >= 0; i--) stack.push({job: children[i], depth: depth + 1});
+  }
+  return result;
+});
+
+function formatAttemptTitle(attempt: ActionsRunAttempt) {
+  return attempt.latest ? `${locale.latestAttempt} #${attempt.attempt}` : `${locale.attempt} #${attempt.attempt}`;
+}
+
+function formatCurrentAttemptTitle(attempt: ActionsRunAttempt) {
+  return attempt.latest ? `${locale.latest} #${attempt.attempt}` : formatAttemptTitle(attempt);
+}
+
+const backLink = computed(() => {
+  if (run.value.pullRequest) {
+    return {href: run.value.pullRequest.link, prefix: locale.backToPullRequest, name: run.value.pullRequest.index};
+  }
+  if (run.value.workflowLink) {
+    return {href: run.value.workflowLink, prefix: locale.backToWorkflow, name: run.value.workflowID.replace(/\.(yml|yaml)$/i, '')};
+  }
+  return null;
+});
+
+function buildArtifactLink(name: string) {
+  const searchString = run.value.runAttempt > 0 ? `?attempt=${run.value.runAttempt}` : '';
+  return `${run.value.link}/artifacts/${encodeURIComponent(name)}${searchString}`;
+}
+
+function cancelRun() {
+  POST(`${run.value.link}/cancel`);
+}
+
+function approveRun() {
+  POST(`${run.value.link}/approve`);
+}
+
+async function deleteArtifact(name: string) {
+  const artifactLink = buildArtifactLink(name);
+  if (!await confirmModal({content: trString(locale.confirmDeleteArtifact, name), confirmButtonColor: 'red'})) return;
+  await DELETE(artifactLink);
+  await store.forceReloadCurrentRun();
+}
+
+watch(() => run.value.status, (status) => {
+  syncActionRunFavicon(status);
+});
+
+onBeforeUnmount(() => {
+  resetActionFavicon();
+});
+</script>
 <template>
-  <div class="action-view-container">
+  <!-- make the view container full width to make users easier to read logs -->
+  <div class="ui fluid container">
     <div class="action-view-header">
-      <div class="action-info-summary gt-ac">
-        <ActionRunStatus :status="run.status" :size="20"/>
-        <div class="action-title">
-          {{ run.title }}
+      <a v-if="backLink" class="action-view-back" :href="backLink.href">
+        <SvgIcon name="octicon-arrow-left" :size="14"/>
+        <span>{{ backLink.prefix }} <span class="action-view-back-name">{{ backLink.name }}</span></span>
+      </a>
+      <div class="action-info-summary">
+        <div class="action-info-summary-title">
+          <ActionStatusIcon :locale-status="locale.status[run.status]" :status="run.status" :size="22" icon-variant="circle-fill"/>
+          <!-- eslint-disable-next-line vue/no-v-html -->
+          <h2 class="action-info-summary-title-text" v-html="run.titleHTML"/>
+          <span class="action-info-summary-title-index">#{{ run.index }}</span>
         </div>
-        <button class="run_approve" @click="approveRun()" v-if="run.canApprove">
-          <i class="play circle outline icon"/>
-        </button>
-        <button class="run_cancel" @click="cancelRun()" v-else-if="run.canCancel">
-          <i class="stop circle outline icon"/>
-        </button>
-      </div>
-      <div class="action-commit-summary">
-        {{ run.commit.localeCommit }}
-        <a :href="run.commit.link">{{ run.commit.shortSHA }}</a>
-        &nbsp;<span class="ui label">
-          <a :href="run.commit.branch.link">{{ run.commit.branch.name }}</a>
-        </span>
-        &nbsp;{{ run.commit.localePushedBy }}
-        <a :href="run.commit.pusher.link">{{ run.commit.pusher.displayName }}</a>
+        <div class="flex-text-block tw-shrink-0 tw-flex-wrap">
+          <button class="ui basic small compact button primary" @click="approveRun()" v-if="run.canApprove">
+            {{ locale.approve }}
+          </button>
+          <button class="ui small compact button tw-text-red" @click="cancelRun()" v-else-if="run.canCancel">
+            {{ locale.cancel }}
+          </button>
+          <template v-if="run.canRerun">
+            <div v-if="run.canRerunFailed" class="ui small compact buttons">
+              <button class="ui basic small compact button link-action" :data-url="`${run.link}/rerun-failed`">
+                {{ locale.rerun_failed }}
+              </button>
+              <div class="ui basic small compact dropdown icon button">
+                <SvgIcon name="octicon-triangle-down" :size="14"/>
+                <div class="menu">
+                  <div class="item link-action" :data-url="`${run.link}/rerun`">
+                    {{ locale.rerun_all }}
+                  </div>
+                </div>
+              </div>
+            </div>
+            <button v-else class="ui basic small compact button link-action" :data-url="`${run.link}/rerun`">
+              {{ locale.rerun_all }}
+            </button>
+          </template>
+          <div v-if="run.attempts.length > 1" class="ui dropdown basic small compact button">
+            <div class="flex-text-inline">
+              <SvgIcon name="octicon-history" :size="14"/>
+              <span>{{ formatCurrentAttemptTitle(run.attempts.find((attempt) => attempt.current)!) }}</span>
+            </div>
+            <SvgIcon name="octicon-triangle-down" :size="14" class="dropdown icon"/>
+            <div class="menu">
+              <a
+                v-for="attempt in run.attempts"
+                :key="attempt.attempt"
+                class="item tw-flex tw-flex-col tw-gap-2"
+                :class="attempt.current ? 'selected' : ''"
+                :href="attempt.link"
+              >
+                <div class="flex-text-block">
+                  <SvgIcon name="octicon-check" :size="14" :class="{'tw-invisible': !Boolean(attempt.current)}"/>
+                  <strong class="tw-text-sm gt-ellipsis">{{ formatAttemptTitle(attempt) }}</strong>
+                </div>
+                <div class="flex-text-block tw-pl-[20px]">
+                  <span class="flex-text-inline tw-flex-shrink-0">
+                    <ActionStatusIcon :locale-status="locale.status[attempt.status]" :status="attempt.status" :size="14" icon-variant="circle-fill"/>
+                    <span>{{ locale.status[attempt.status] }}</span>
+                  </span>
+                  <span>•</span>
+                  <relative-time :datetime="attempt.triggeredAt" prefix=""/>
+                  <span>•</span>
+                  <span class="gt-ellipsis">{{ attempt.triggerUserName }}</span>
+                </div>
+              </a>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
     <div class="action-view-body">
       <div class="action-view-left">
-        <div class="job-group-section">
-          <div class="job-brief-list">
-            <div class="job-brief-item" v-for="(job, index) in run.jobs" :key="job.id">
-              <a class="job-brief-link" :href="run.link+'/jobs/'+index">
-                <ActionRunStatus :status="job.status"/>
-                <span class="ui text gt-mx-3">{{ job.name }}</span>
-              </a>
-              <span class="step-summary-duration">{{ job.duration }}</span>
-              <button class="job-brief-rerun" @click="rerunJob(index)" v-if="job.canRerun">
-                <SvgIcon name="octicon-sync" class="ui text black"/>
-              </button>
+        <!-- summary -->
+        <div class="flex-items-block action-view-sidebar-list">
+          <a class="item silenced" :href="run.viewLink" :class="!props.jobId ? 'selected' : ''">
+            <SvgIcon name="octicon-home"/>
+            <span class="gt-ellipsis">{{ locale.summary }}</span>
+          </a>
+        </div>
+
+        <!-- jobs list -->
+        <div class="ui divider"/>
+        <div class="left-list-header">{{ locale.allJobs }}</div>
+        <div class="flex-items-block action-view-sidebar-list">
+          <template
+            v-for="item in visibleJobListItems"
+            :key="item.job.id"
+          >
+            <!-- Callers have no log page of their own; the whole row toggles expansion
+                 (matches GitHub Actions, where caller rows are not navigation targets). -->
+            <button
+              v-if="item.job.isReusableCaller"
+              type="button"
+              class="item caller-row-toggle"
+              :class="{'selected': props.jobId === item.job.id}"
+              :style="{paddingLeft: `${10 + item.depth * 16}px`}"
+              @click="toggleExpandedJob(item.job.id)"
+              :title="isJobCollapsed(item.job.id) ? locale.expandCallerJobs : locale.collapseCallerJobs"
+              :aria-label="isJobCollapsed(item.job.id) ? locale.expandCallerJobs : locale.collapseCallerJobs"
+              :aria-expanded="!isJobCollapsed(item.job.id)"
+            >
+              <ActionStatusIcon :locale-status="locale.status[item.job.status]" :status="item.job.status" icon-variant="circle-fill"/>
+              <span class="tw-min-w-0 gt-ellipsis">{{ item.job.name }}</span>
+              <span class="job-duration">{{ item.job.duration }}</span>
+              <SvgIcon name="octicon-chevron-down" :size="14" class="job-brief-toggle-icon" :class="{'collapsed': isJobCollapsed(item.job.id)}"/>
+            </button>
+            <a
+              v-else
+              class="item silenced"
+              :class="{'selected': props.jobId === item.job.id}"
+              :style="{paddingLeft: `${10 + item.depth * 16}px`}"
+              :href="item.job.link"
+            >
+              <ActionStatusIcon :locale-status="locale.status[item.job.status]" :status="item.job.status" icon-variant="circle-fill"/>
+              <span class="tw-min-w-0 gt-ellipsis">{{ item.job.name }}</span>
+              <SvgIcon name="octicon-sync" role="button" :data-tooltip-content="locale.rerun" class="job-rerun-button tw-cursor-pointer link-action interact-fg" :data-url="`${run.link}/jobs/${item.job.id}/rerun`" v-if="item.job.canRerun"/>
+              <span class="job-duration">{{ item.job.duration }}</span>
+            </a>
+          </template>
+        </div>
+
+        <!-- artifacts list -->
+        <template v-if="artifacts.length > 0">
+          <div class="ui divider"/>
+          <div class="left-list-header">{{ locale.artifactsTitle }} ({{ artifacts.length }})</div>
+          <div class="flex-items-block action-view-sidebar-list">
+            <div class="item" v-for="artifact in artifacts" :key="artifact.name">
+              <template v-if="artifact.status !== 'expired'">
+                <a
+                  class="tw-flex-1 tw-min-w-0 flex-text-block silenced"
+                  :href="artifact.previewLink"
+                  :data-tooltip-content="buildArtifactTooltipHtml(artifact, locale.artifactExpiresAt)"
+                  data-tooltip-render="html"
+                  data-tooltip-placement="top-end"
+                >
+                  <SvgIcon name="octicon-file" class="tw-text-text-light"/>
+                  <span class="tw-flex-1 gt-ellipsis">{{ artifact.name }}</span>
+                </a>
+                <a download class="silenced" :href="buildArtifactLink(artifact.name)" :data-tooltip-content="locale.downloadFile">
+                  <SvgIcon name="octicon-download"/>
+                </a>
+                <a v-if="run.canDeleteArtifact" class="silenced" @click="deleteArtifact(artifact.name)">
+                  <SvgIcon name="octicon-trash"/>
+                </a>
+              </template>
+              <span
+                v-else class="flex-text-block tw-flex-1 tw-min-w-0 tw-text-text-light-2"
+                :data-tooltip-content="buildArtifactTooltipHtml(artifact, locale.artifactExpiredAt)"
+                data-tooltip-render="html"
+                data-tooltip-placement="top-end"
+              >
+                <SvgIcon name="octicon-file-removed"/>
+                <span class="tw-flex-1 gt-ellipsis">{{ artifact.name }}</span>
+                <span class="ui label tw-flex-shrink-0">{{ locale.artifactExpired }}</span>
+              </span>
             </div>
+          </div>
+        </template>
+
+        <!-- run details -->
+        <div class="ui divider"/>
+        <div class="left-list-header">{{ locale.runDetails }}</div>
+        <div class="flex-items-block action-view-sidebar-list">
+          <div class="item">
+            <a v-if="run.canViewWorkflowFile" class="flex-text-block silenced" :href="`${run.link}/workflow`">
+              <SvgIcon name="octicon-file-code" class="tw-text-text"/>
+              <span class="gt-ellipsis">{{ locale.workflowFile }}</span>
+            </a>
+            <span v-else class="flex-text-block silenced" :data-tooltip-content="locale.workflowFileNoPermission">
+              <SvgIcon name="octicon-lock" class="tw-text-text"/>
+              <span class="gt-ellipsis">{{ locale.workflowFileNoPermission }}</span>
+            </span>
           </div>
         </div>
       </div>
 
       <div class="action-view-right">
-        <div class="job-info-header">
-          <div class="job-info-header-title">
-            {{ currentJob.title }}
-          </div>
-          <div class="job-info-header-detail">
-            {{ currentJob.detail }}
-          </div>
+        <div class="action-view-right-panel">
+          <ActionRunSummaryView
+            v-if="!props.jobId"
+            :store="store"
+            :locale="locale"
+            :artifact-count="artifacts.length"
+          />
+          <ActionRunJobView
+            v-else
+            :store="store"
+            :locale="locale"
+            :actions-view-url="props.actionsViewUrl"
+            :job-id="props.jobId"
+          />
         </div>
-        <div class="job-step-container">
-          <div class="job-step-section" v-for="(jobStep, i) in currentJob.steps" :key="i">
-            <div class="job-step-summary" @click.stop="toggleStepLogs(i)">
-              <SvgIcon :name="currentJobStepsStates[i].expanded ? 'octicon-chevron-down': 'octicon-chevron-right'" class="gt-mr-3"/>
-
-              <ActionRunStatus :status="jobStep.status" class="gt-mr-3"/>
-
-              <span class="step-summary-msg">{{ jobStep.summary }}</span>
-              <span class="step-summary-duration">{{ jobStep.duration }}</span>
+        <div v-if="visibleJobSummaries.length" class="action-view-right-panel job-summary-section">
+          <div class="job-summary-section-header">
+            {{ locale.jobSummaries }}
+          </div>
+          <div class="job-summary-list">
+            <div v-for="s in visibleJobSummaries" :key="s.jobId" class="job-summary-item">
+              <div class="job-summary-header">
+                <strong class="gt-ellipsis">{{ s.jobName || `Job ${s.jobId}` }}</strong>
+              </div>
+              <!-- eslint-disable-next-line vue/no-v-html -->
+              <div class="markup job-summary-body" v-html="s.summaryHTML"/>
             </div>
-
-            <!-- the log elements could be a lot, do not use v-if to destroy/reconstruct the DOM -->
-            <div class="job-step-logs" ref="logs" v-show="currentJobStepsStates[i].expanded"/>
           </div>
         </div>
       </div>
     </div>
   </div>
 </template>
-
-<script>
-import {SvgIcon} from '../svg.js';
-import ActionRunStatus from './ActionRunStatus.vue';
-import {createApp} from 'vue';
-import AnsiToHTML from 'ansi-to-html';
-
-const {csrfToken} = window.config;
-
-const ansiLogRender = new AnsiToHTML({escapeXML: true});
-
-const sfc = {
-  name: 'RepoActionView',
-  components: {
-    SvgIcon,
-    ActionRunStatus,
-  },
-  props: {
-    runIndex: String,
-    jobIndex: String,
-    actionsURL: String,
-  },
-
-  data() {
-    return {
-      // internal state
-      loading: false,
-      intervalID: null,
-      currentJobStepsStates: [],
-
-      // provided by backend
-      run: {
-        link: '',
-        title: '',
-        status: '',
-        canCancel: false,
-        canApprove: false,
-        done: false,
-        jobs: [
-          // {
-          //   id: 0,
-          //   name: '',
-          //   status: '',
-          //   canRerun: false,
-          //   duration: '',
-          // },
-        ],
-        commit: {
-          localeCommit: '',
-          localePushedBy: '',
-          shortSHA: '',
-          link: '',
-          pusher: {
-            displayName: '',
-            link: '',
-          },
-          branch: {
-            name: '',
-            link: '',
-          },
-        }
-      },
-      currentJob: {
-        title: '',
-        detail: '',
-        steps: [
-          // {
-          //   summary: '',
-          //   duration: '',
-          //   status: '',
-          // }
-        ],
-      },
-    };
-  },
-
-  mounted() {
-    // load job data and then auto-reload periodically
-    this.loadJob();
-    this.intervalID = setInterval(this.loadJob, 1000);
-  },
-
-  methods: {
-    // get the active container element, either the `job-step-logs` or the `job-log-list` in the `job-log-group`
-    getLogsContainer(idx) {
-      const el = this.$refs.logs[idx];
-      return el._stepLogsActiveContainer ?? el;
-    },
-    // begin a log group
-    beginLogGroup(idx) {
-      const el = this.$refs.logs[idx];
-
-      const elJobLogGroup = document.createElement('div');
-      elJobLogGroup.classList.add('job-log-group');
-
-      const elJobLogGroupSummary = document.createElement('div');
-      elJobLogGroupSummary.classList.add('job-log-group-summary');
-
-      const elJobLogList = document.createElement('div');
-      elJobLogList.classList.add('job-log-list');
-
-      elJobLogGroup.appendChild(elJobLogGroupSummary);
-      elJobLogGroup.appendChild(elJobLogList);
-      el._stepLogsActiveContainer = elJobLogList;
-    },
-    // end a log group
-    endLogGroup(idx) {
-      const el = this.$refs.logs[idx];
-      el._stepLogsActiveContainer = null;
-    },
-
-    // show/hide the step logs for a step
-    toggleStepLogs(idx) {
-      this.currentJobStepsStates[idx].expanded = !this.currentJobStepsStates[idx].expanded;
-      if (this.currentJobStepsStates[idx].expanded) {
-        this.loadJob(); // try to load the data immediately instead of waiting for next timer interval
-      }
-    },
-    // rerun a job
-    async rerunJob(idx) {
-      const jobLink = `${this.run.link}/jobs/${idx}`;
-      await this.fetchPost(`${jobLink}/rerun`);
-      window.location.href = jobLink;
-    },
-    // cancel a run
-    cancelRun() {
-      this.fetchPost(`${this.run.link}/cancel`);
-    },
-    // approve a run
-    approveRun() {
-      this.fetchPost(`${this.run.link}/approve`);
-    },
-
-    createLogLine(line) {
-      const div = document.createElement('div');
-      div.classList.add('job-log-line');
-      div._jobLogTime = line.timestamp;
-
-      const lineNumber = document.createElement('div');
-      lineNumber.className = 'line-num';
-      lineNumber.innerText = line.index;
-      div.appendChild(lineNumber);
-
-      // TODO: Support displaying time optionally
-
-      const logMessage = document.createElement('div');
-      logMessage.className = 'log-msg';
-      logMessage.innerHTML = ansiLogToHTML(line.message);
-      div.appendChild(logMessage);
-
-      return div;
-    },
-
-    appendLogs(stepIndex, logLines) {
-      for (const line of logLines) {
-        // TODO: group support: ##[group]GroupTitle , ##[endgroup]
-        const el = this.getLogsContainer(stepIndex);
-        el.append(this.createLogLine(line));
-      }
-    },
-
-    async fetchJob() {
-      const logCursors = this.currentJobStepsStates.map((it, idx) => {
-        // cursor is used to indicate the last position of the logs
-        // it's only used by backend, frontend just reads it and passes it back, it and can be any type.
-        // for example: make cursor=null means the first time to fetch logs, cursor=eof means no more logs, etc
-        return {step: idx, cursor: it.cursor, expanded: it.expanded};
-      });
-      const resp = await this.fetchPost(
-        `${this.actionsURL}/runs/${this.runIndex}/jobs/${this.jobIndex}`,
-        JSON.stringify({logCursors}),
-      );
-      return await resp.json();
-    },
-
-    async loadJob() {
-      if (this.loading) return;
-      try {
-        this.loading = true;
-
-        const response = await this.fetchJob();
-
-        // save the state to Vue data, then the UI will be updated
-        this.run = response.state.run;
-        this.currentJob = response.state.currentJob;
-
-        // sync the currentJobStepsStates to store the job step states
-        for (let i = 0; i < this.currentJob.steps.length; i++) {
-          if (!this.currentJobStepsStates[i]) {
-            this.currentJobStepsStates[i] = {cursor: null, expanded: false};
-          }
-        }
-        // append logs to the UI
-        for (const logs of response.logs.stepsLog) {
-          // save the cursor, it will be passed to backend next time
-          this.currentJobStepsStates[logs.step].cursor = logs.cursor;
-          this.appendLogs(logs.step, logs.lines);
-        }
-
-        if (this.run.done && this.intervalID) {
-          clearInterval(this.intervalID);
-          this.intervalID = null;
-        }
-      } finally {
-        this.loading = false;
-      }
-    },
-
-    fetchPost(url, body) {
-      return fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Csrf-Token': csrfToken,
-        },
-        body,
-      });
-    },
-  },
-};
-
-export default sfc;
-
-export function initRepositoryActionView() {
-  const el = document.getElementById('repo-action-view');
-  if (!el) return;
-
-  // TODO: the parent element's full height doesn't work well now,
-  // but we can not pollute the global style at the moment, only fix the height problem for pages with this component
-  const parentFullHeight = document.querySelector('body > div.full.height');
-  if (parentFullHeight) parentFullHeight.style.paddingBottom = '0';
-
-  const view = createApp(sfc, {
-    runIndex: el.getAttribute('data-run-index'),
-    jobIndex: el.getAttribute('data-job-index'),
-    actionsURL: el.getAttribute('data-actions-url'),
-  });
-  view.mount(el);
-}
-
-// some unhandled control sequences by AnsiToHTML
-// https://man7.org/linux/man-pages/man4/console_codes.4.html
-const ansiRegexpRemove = /\x1b\[\d+[A-H]/g; // Move cursor, treat them as no-op.
-const ansiRegexpNewLine = /\x1b\[\d?[JK]/g; // Erase display/line, treat them as a Carriage Return
-
-function ansiCleanControlSequences(line) {
-  if (line.includes('\x1b')) {
-    line = line.replace(ansiRegexpRemove, '');
-    line = line.replace(ansiRegexpNewLine, '\r');
-  }
-  return line;
-}
-
-export function ansiLogToHTML(line) {
-  if (line.endsWith('\r\n')) {
-    line = line.substring(0, line.length - 2);
-  } else if (line.endsWith('\n')) {
-    line = line.substring(0, line.length - 1);
-  }
-
-  // usually we do not need to process control chars like "\033[", let AnsiToHTML do it
-  // but AnsiToHTML has bugs, so we need to clean some control sequences first
-  line = ansiCleanControlSequences(line);
-
-  if (!line.includes('\r')) {
-    return ansiLogRender.toHtml(line);
-  }
-
-  // handle "\rReading...1%\rReading...5%\rReading...100%",
-  // convert it into a multiple-line string: "Reading...1%\nReading...5%\nReading...100%"
-  const lines = [];
-  for (const part of line.split('\r')) {
-    if (part === '') continue;
-    const partHtml = ansiLogRender.toHtml(part);
-    if (partHtml !== '') {
-      lines.push(partHtml);
-    }
-  }
-  // the log message element is with "white-space: break-spaces;", so use "\n" to break lines
-  return lines.join('\n');
-}
-
-</script>
-
 <style scoped>
 .action-view-body {
+  padding-top: 12px;
+  padding-bottom: 12px;
   display: flex;
-  height: calc(100vh - 266px); /* fine tune this value to make the main view has full height */
-}
-
-/* ================ */
-/* action view header */
-
-.action-view-header {
-  margin: 0 20px 20px 20px;
-}
-
-.action-view-header .run_cancel {
-  border: none;
-  color: var(--color-red);
-  background-color: transparent;
-  outline: none;
-  cursor: pointer;
-  transition: transform 0.2s;
-}
-
-.action-view-header .run_approve {
-  border: none;
-  color: var(--color-green);
-  background-color: transparent;
-  outline: none;
-  cursor: pointer;
-  transition: transform 0.2s;
-}
-
-.action-view-header .run_cancel:hover,
-.action-view-header .run_approve:hover {
-  transform: scale(130%);
-}
-
-.action-info-summary {
-  font-size: 150%;
-  height: 20px;
-  display: flex;
-}
-
-.action-info-summary .action-title {
-  padding: 0 5px;
-}
-
-.action-commit-summary {
-  padding: 10px 10px;
+  gap: 12px;
 }
 
 /* ================ */
@@ -409,51 +385,96 @@ export function ansiLogToHTML(line) {
 .action-view-left {
   width: 30%;
   max-width: 400px;
-  overflow-y: scroll;
-  margin-left: 10px;
+  position: sticky;
+  top: 12px;
+
+  /* about 12px top padding + 12px bottom padding + 37px footer height,
+  TODO: need to use JS to calculate the height for better scrolling experience*/
+  max-height: calc(100vh - 62px);
+
+  overflow-y: auto;
+  background: var(--color-body);
+  z-index: 2; /* above .job-info-header */
 }
 
-.job-group-section .job-group-summary {
-  margin: 5px 0;
-  padding: 10px;
+@media (max-width: 767.98px) {
+  .action-view-left {
+    position: static; /* can not sticky because multiple jobs would overlap into right view */
+    max-height: unset;
+  }
 }
 
-.job-group-section .job-brief-list .job-brief-item {
-  margin: 5px 0;
-  padding: 10px;
-  background: var(--color-info-bg);
-  border-radius: 5px;
-  text-decoration: none;
-  display: flex;
-  justify-items: center;
-  flex-wrap: nowrap;
+.left-list-header {
+  font-size: 13px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-light-2);
 }
 
-.job-group-section .job-brief-list .job-brief-item .job-brief-rerun {
-  float: right;
+.action-view-sidebar-list {
+  margin: var(--gap-block) 0;
+}
+
+.action-view-sidebar-list:first-child {
+  margin-top: 0;
+}
+
+.action-view-sidebar-list > .item {
+  padding: 6px 10px;
+  border-radius: var(--border-radius);
+}
+
+.action-view-sidebar-list > .item:hover {
+  background-color: var(--color-hover);
+}
+
+.action-view-sidebar-list > .item.selected {
+  font-weight: var(--font-weight-bold);
+  background-color: var(--color-active);
+}
+
+.caller-row-toggle {
+  width: 100%;
   border: none;
-  background-color: transparent;
-  outline: none;
+  background: transparent;
+  color: inherit;
+  line-height: inherit; /* buttons don't inherit line-height; match the <a> rows' row height */
   cursor: pointer;
-  transition: transform 0.2s;
+  text-align: inherit;
 }
 
-.job-group-section .job-brief-list .job-brief-item .job-brief-rerun:hover {
-  transform: scale(130%);
+.job-brief-toggle-icon {
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+  /* sit between name and duration; duration uses order:2 with margin-left:auto to float right */
+  order: 1;
 }
 
-.job-group-section .job-brief-list .job-brief-item .job-brief-link {
-  flex-grow: 1;
-  display: flex;
+.job-brief-toggle-icon:not(.collapsed) {
+  transform: rotate(180deg);
 }
 
-.job-group-section .job-brief-list .job-brief-item .job-brief-link span {
-  display: flex;
-  align-items: center;
+/* push rerun/duration to the right edge; only one is visible at a time (hover swap),
+   the visible one absorbs the free space via auto-margin */
+.action-view-sidebar-list > .item .job-rerun-button,
+.action-view-sidebar-list > .item .job-duration {
+  order: 2;
+  margin-left: auto;
 }
 
-.job-group-section .job-brief-list .job-brief-item:hover {
-  background-color: var(--color-secondary);
+/* the re-run button replaces the duration on hover or job-link focus */
+.action-view-sidebar-list > .item .job-rerun-button {
+  display: none;
+}
+
+.action-view-sidebar-list > .item:hover .job-rerun-button,
+.action-view-sidebar-list > .item:focus .job-rerun-button {
+  display: inline-flex;
+}
+
+/* only swap out the duration when a re-run button exists to take its place */
+.action-view-sidebar-list > .item:hover .job-rerun-button ~ .job-duration,
+.action-view-sidebar-list > .item:focus .job-rerun-button ~ .job-duration {
+  display: none;
 }
 
 /* ================ */
@@ -461,100 +482,69 @@ export function ansiLogToHTML(line) {
 
 .action-view-right {
   flex: 1;
-  background-color: var(--color-console-bg);
-  color: var(--color-console-fg);
+  color: var(--color-console-fg-subtle);
   max-height: 100%;
-  margin-right: 10px;
+  width: 70%;
   display: flex;
   flex-direction: column;
+  gap: 12px;
 }
 
-.job-info-header .job-info-header-title {
-  font-size: 150%;
-  padding: 10px;
-}
-
-.job-info-header .job-info-header-detail {
-  padding: 0 10px 10px;
-  border-bottom: 1px solid var(--color-grey);
-}
-
-.job-step-container {
-  max-height: 100%;
-  overflow: auto;
-}
-
-.job-step-container .job-step-summary {
-  cursor: pointer;
-  padding: 5px 10px;
+.action-view-right-panel {
+  flex: 1; /* fill the right column so the summary graph stretches even without a job-summary section */
+  border: 1px solid var(--color-secondary);
+  border-radius: var(--border-radius);
+  background: var(--color-console-bg);
   display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
-.job-step-container .job-step-summary .step-summary-msg {
-  flex: 1;
-}
-
-.job-step-container .job-step-summary .step-summary-duration {
-  margin-left: 16px;
-}
-
-.job-step-container .job-step-summary:hover {
-  background-color: var(--color-black-light);
-}
-</style>
-
-<style>
-/* some elements are not managed by vue, so we need to use global style */
-.job-status-rotate {
-  animation: job-status-rotate-keyframes 1s linear infinite;
-}
-
-@keyframes job-status-rotate-keyframes {
-  100% {
-    transform: rotate(360deg);
+@media (max-width: 767.98px) {
+  .action-view-body {
+    flex-direction: column;
+  }
+  .action-view-left, .action-view-right {
+    width: 100%;
+  }
+  .action-view-left {
+    max-width: none;
   }
 }
 
-.job-step-section {
-  margin: 10px;
+.job-summary-section {
+  flex: 0 0 auto; /* size to its content; let the summary panel keep the remaining height */
+  overflow: hidden;
 }
 
-.job-step-section .job-step-logs {
-  font-family: monospace, monospace;
+.job-summary-section-header {
+  padding: 12px;
+  border-bottom: 1px solid var(--color-secondary);
+  background: var(--color-console-bg);
+  color: var(--color-console-fg);
+  font-weight: var(--font-weight-semibold);
 }
 
-.job-step-section .job-step-logs .job-log-line {
+.job-summary-list {
+  padding: 12px;
   display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
-.job-step-section .job-step-logs .job-log-line .line-num {
-  width: 48px;
-  color: var(--color-grey-light);
-  text-align: right;
+.job-summary-item {
+  padding: 12px;
+  border-radius: var(--border-radius);
+  background: var(--color-console-hover-bg);
+  border: 1px solid var(--color-secondary);
 }
 
-.job-step-section .job-step-logs .job-log-line .log-time {
-  color: var(--color-grey-light);
-  margin-left: 10px;
-  white-space: nowrap;
+.job-summary-header {
+  color: var(--color-console-fg);
+  margin-bottom: 8px;
 }
 
-.job-step-section .job-step-logs .job-log-line .log-msg {
-  flex: 1;
-  word-break: break-all;
-  white-space: break-spaces;
-  margin-left: 10px;
-}
-
-/* TODO: group support */
-
-.job-log-group {
-
-}
-.job-log-group-summary {
-
-}
-.job-log-list {
-
+.job-summary-body {
+  color: var(--color-console-fg);
 }
 </style>

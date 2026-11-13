@@ -4,48 +4,33 @@
 package forms
 
 import (
-	"strconv"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/glob"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestRegisterForm_IsDomainAllowed_Empty(t *testing.T) {
-	_ = setting.Service
-
-	setting.Service.EmailDomainWhitelist = []string{}
-
+	defer test.MockVariableValue(&setting.Service)()
+	setting.Service.EmailDomainAllowList = nil
 	form := RegisterForm{}
-
 	assert.True(t, form.IsEmailDomainAllowed())
 }
 
 func TestRegisterForm_IsDomainAllowed_InvalidEmail(t *testing.T) {
-	_ = setting.Service
+	defer test.MockVariableValue(&setting.Service.EmailDomainAllowList, []glob.Glob{glob.MustCompile("gitea.io")})()
 
-	setting.Service.EmailDomainWhitelist = []string{"gitea.io"}
-
-	tt := []struct {
-		email string
-	}{
-		{"securitygieqqq"},
-		{"hdudhdd"},
-	}
-
-	for _, v := range tt {
-		form := RegisterForm{Email: v.email}
-
+	for _, email := range []string{"invalid-email", "gitea.io"} {
+		form := RegisterForm{Email: email}
 		assert.False(t, form.IsEmailDomainAllowed())
 	}
 }
 
-func TestRegisterForm_IsDomainAllowed_WhitelistedEmail(t *testing.T) {
-	_ = setting.Service
-
-	setting.Service.EmailDomainWhitelist = []string{"gitea.io"}
+func TestRegisterForm_IsDomainAllowed_AllowedEmail(t *testing.T) {
+	defer test.MockVariableValue(&setting.Service.EmailDomainAllowList, []glob.Glob{glob.MustCompile("gitea.io"), glob.MustCompile("*.allow")})()
 
 	tt := []struct {
 		email string
@@ -53,8 +38,12 @@ func TestRegisterForm_IsDomainAllowed_WhitelistedEmail(t *testing.T) {
 	}{
 		{"security@gitea.io", true},
 		{"security@gITea.io", true},
-		{"hdudhdd", false},
+		{"hack%evil.example@gitea.io", false},
+		{"invalid", false},
 		{"seee@example.com", false},
+
+		{"user@my.allow", true},
+		{"user@my.allow1", false},
 	}
 
 	for _, v := range tt {
@@ -64,11 +53,8 @@ func TestRegisterForm_IsDomainAllowed_WhitelistedEmail(t *testing.T) {
 	}
 }
 
-func TestRegisterForm_IsDomainAllowed_BlocklistedEmail(t *testing.T) {
-	_ = setting.Service
-
-	setting.Service.EmailDomainWhitelist = []string{}
-	setting.Service.EmailDomainBlocklist = []string{"gitea.io"}
+func TestRegisterForm_IsDomainAllowed_BlockedEmail(t *testing.T) {
+	defer test.MockVariableValue(&setting.Service.EmailDomainBlockList, []glob.Glob{glob.MustCompile("gitea.io"), glob.MustCompile("*.block")})()
 
 	tt := []struct {
 		email string
@@ -76,7 +62,11 @@ func TestRegisterForm_IsDomainAllowed_BlocklistedEmail(t *testing.T) {
 	}{
 		{"security@gitea.io", false},
 		{"security@gitea.example", true},
-		{"hdudhdd", true},
+		{"gitea.io!hack@gitea.example", false},
+		{"invalid", true},
+
+		{"user@my.block", false},
+		{"user@my.block1", true},
 	}
 
 	for _, v := range tt {
@@ -86,27 +76,18 @@ func TestRegisterForm_IsDomainAllowed_BlocklistedEmail(t *testing.T) {
 	}
 }
 
-func TestNewAccessTokenForm_GetScope(t *testing.T) {
-	tests := []struct {
-		form        NewAccessTokenForm
-		scope       auth_model.AccessTokenScope
-		expectedErr error
-	}{
-		{
-			form:  NewAccessTokenForm{Name: "test", Scope: []string{"repo"}},
-			scope: "repo",
-		},
-		{
-			form:  NewAccessTokenForm{Name: "test", Scope: []string{"repo", "user"}},
-			scope: "repo,user",
-		},
+func TestDetectInvalidOAuth2ApplicationRedirectURI(t *testing.T) {
+	defer test.MockVariableValue(&setting.OAuth2.CustomSchemes)()
+	setting.OAuth2.CustomSchemes = []string{"my-app"}
+	for _, uri := range []string{"my-app:", "my-app:/foo", "http://foo", "https://foo"} {
+		assert.Empty(t, DetectInvalidOAuth2ApplicationRedirectURI([]string{uri}))
+	}
+	for _, uri := range []string{"my-app", "ftp:", "ftp://foo", "https://[invalid"} {
+		assert.Equal(t, uri, DetectInvalidOAuth2ApplicationRedirectURI([]string{uri}))
 	}
 
-	for i, test := range tests {
-		t.Run(strconv.Itoa(i), func(t *testing.T) {
-			scope, err := test.form.GetScope()
-			assert.Equal(t, test.expectedErr, err)
-			assert.Equal(t, test.scope, scope)
-		})
-	}
+	ret := DetectInvalidOAuth2ApplicationRedirectURI([]string{"my-app:", "http://foo", "https://foo"})
+	assert.Empty(t, ret)
+	ret = DetectInvalidOAuth2ApplicationRedirectURI([]string{"my-app:", "http://foo", "invalid", "https://foo"})
+	assert.Equal(t, "invalid", ret)
 }

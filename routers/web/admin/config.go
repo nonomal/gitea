@@ -5,27 +5,25 @@
 package admin
 
 import (
-	"fmt"
 	"net/http"
-	"net/url"
-	"os"
-	"strconv"
-	"strings"
 
-	system_model "code.gitea.io/gitea/models/system"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/services/mailer"
-
-	"gitea.com/go-chi/session"
+	system_model "gitea.dev/models/system"
+	"gitea.dev/modules/cache"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/setting/config"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/context"
+	"gitea.dev/services/mailer"
 )
 
-const tplConfig base.TplName = "admin/config"
+const (
+	tplConfig         templates.TplName = "admin/config"
+	tplConfigSettings templates.TplName = "admin/config_settings/config_settings"
+)
 
 // SendTestMail send test mail to confirm mail service is OK
 func SendTestMail(ctx *context.Context) {
@@ -37,95 +35,40 @@ func SendTestMail(ctx *context.Context) {
 		ctx.Flash.Info(ctx.Tr("admin.config.test_mail_sent", email))
 	}
 
-	ctx.Redirect(setting.AppSubURL + "/admin/config")
+	ctx.Redirect(setting.AppSubURL + "/-/admin/config")
 }
 
-func shadowPasswordKV(cfgItem, splitter string) string {
-	fields := strings.Split(cfgItem, splitter)
-	for i := 0; i < len(fields); i++ {
-		if strings.HasPrefix(fields[i], "password=") {
-			fields[i] = "password=******"
-			break
-		}
-	}
-	return strings.Join(fields, splitter)
-}
-
-func shadowURL(provider, cfgItem string) string {
-	u, err := url.Parse(cfgItem)
+// TestCache test the cache settings
+func TestCache(ctx *context.Context) {
+	elapsed, err := cache.Test()
 	if err != nil {
-		log.Error("Shadowing Password for %v failed: %v", provider, err)
-		return cfgItem
-	}
-	if u.User != nil {
-		atIdx := strings.Index(cfgItem, "@")
-		if atIdx > 0 {
-			colonIdx := strings.LastIndex(cfgItem[:atIdx], ":")
-			if colonIdx > 0 {
-				return cfgItem[:colonIdx+1] + "******" + cfgItem[atIdx:]
-			}
+		ctx.Flash.Error(ctx.Tr("admin.config.cache_test_failed", err))
+	} else {
+		if elapsed > cache.SlowCacheThreshold {
+			ctx.Flash.Warning(ctx.Tr("admin.config.cache_test_slow", elapsed))
+		} else {
+			ctx.Flash.Info(ctx.Tr("admin.config.cache_test_succeeded", elapsed))
 		}
 	}
-	return cfgItem
-}
 
-func shadowPassword(provider, cfgItem string) string {
-	switch provider {
-	case "redis":
-		return shadowPasswordKV(cfgItem, ",")
-	case "mysql":
-		// root:@tcp(localhost:3306)/macaron?charset=utf8
-		atIdx := strings.Index(cfgItem, "@")
-		if atIdx > 0 {
-			colonIdx := strings.Index(cfgItem[:atIdx], ":")
-			if colonIdx > 0 {
-				return cfgItem[:colonIdx+1] + "******" + cfgItem[atIdx:]
-			}
-		}
-		return cfgItem
-	case "postgres":
-		// user=jiahuachen dbname=macaron port=5432 sslmode=disable
-		if !strings.HasPrefix(cfgItem, "postgres://") {
-			return shadowPasswordKV(cfgItem, " ")
-		}
-		fallthrough
-	case "couchbase":
-		return shadowURL(provider, cfgItem)
-		// postgres://pqgotest:password@localhost/pqgotest?sslmode=verify-full
-		// Notice: use shadowURL
-	}
-	return cfgItem
+	ctx.Redirect(setting.AppSubURL + "/-/admin/config")
 }
 
 // Config show admin config page
 func Config(ctx *context.Context) {
-	ctx.Data["Title"] = ctx.Tr("admin.config")
-	ctx.Data["PageIsAdmin"] = true
+	ctx.Data["Title"] = ctx.Tr("admin.config_summary")
 	ctx.Data["PageIsAdminConfig"] = true
-
-	systemSettings, err := system_model.GetAllSettings(ctx)
-	if err != nil {
-		ctx.ServerError("system_model.GetAllSettings", err)
-		return
-	}
-
-	// All editable settings from UI
-	ctx.Data["SystemSettings"] = systemSettings
-	ctx.PageData["adminConfigPage"] = true
+	ctx.Data["PageIsAdminConfigSummary"] = true
 
 	ctx.Data["CustomConf"] = setting.CustomConf
-	ctx.Data["AppUrl"] = setting.AppURL
 	ctx.Data["AppBuiltWith"] = setting.AppBuiltWith
-	ctx.Data["Domain"] = setting.Domain
-	ctx.Data["OfflineMode"] = setting.OfflineMode
-	ctx.Data["DisableRouterLog"] = setting.Log.DisableRouterLog
 	ctx.Data["RunUser"] = setting.RunUser
 	ctx.Data["RunMode"] = util.ToTitleCase(setting.RunMode)
-	ctx.Data["GitVersion"] = git.VersionInfo()
+	ctx.Data["GitVersion"] = git.DefaultFeatures().VersionInfo()
 
+	ctx.Data["AppDataPath"] = setting.AppDataPath
 	ctx.Data["RepoRootPath"] = setting.RepoRootPath
 	ctx.Data["CustomRootPath"] = setting.CustomPath
-	ctx.Data["StaticRootPath"] = setting.StaticRootPath
 	ctx.Data["LogRootPath"] = setting.Log.RootPath
 	ctx.Data["ScriptType"] = setting.ScriptType
 	ctx.Data["ReverseProxyAuthUser"] = setting.ReverseProxyAuthUser
@@ -137,7 +80,6 @@ func Config(ctx *context.Context) {
 	ctx.Data["Service"] = setting.Service
 	ctx.Data["DbCfg"] = setting.Database
 	ctx.Data["Webhook"] = setting.Webhook
-
 	ctx.Data["MailerEnabled"] = false
 	if setting.MailService != nil {
 		ctx.Data["MailerEnabled"] = true
@@ -146,102 +88,74 @@ func Config(ctx *context.Context) {
 
 	ctx.Data["CacheAdapter"] = setting.CacheService.Adapter
 	ctx.Data["CacheInterval"] = setting.CacheService.Interval
-
-	ctx.Data["CacheConn"] = shadowPassword(setting.CacheService.Adapter, setting.CacheService.Conn)
 	ctx.Data["CacheItemTTL"] = setting.CacheService.TTL
 
 	sessionCfg := setting.SessionConfig
-	if sessionCfg.Provider == "VirtualSession" {
-		var realSession session.Options
-		if err := json.Unmarshal([]byte(sessionCfg.ProviderConfig), &realSession); err != nil {
-			log.Error("Unable to unmarshall session config for virtual provider config: %s\nError: %v", sessionCfg.ProviderConfig, err)
-		}
-		sessionCfg.Provider = realSession.Provider
-		sessionCfg.ProviderConfig = realSession.ProviderConfig
-		sessionCfg.CookieName = realSession.CookieName
-		sessionCfg.CookiePath = realSession.CookiePath
-		sessionCfg.Gclifetime = realSession.Gclifetime
-		sessionCfg.Maxlifetime = realSession.Maxlifetime
-		sessionCfg.Secure = realSession.Secure
-		sessionCfg.Domain = realSession.Domain
-	}
-	sessionCfg.ProviderConfig = shadowPassword(sessionCfg.Provider, sessionCfg.ProviderConfig)
+	sessionCfg.ProviderConfig = ""
 	ctx.Data["SessionConfig"] = sessionCfg
 
 	ctx.Data["Git"] = setting.Git
-
-	type envVar struct {
-		Name, Value string
-	}
-
-	envVars := map[string]*envVar{}
-	if len(os.Getenv("GITEA_WORK_DIR")) > 0 {
-		envVars["GITEA_WORK_DIR"] = &envVar{"GITEA_WORK_DIR", os.Getenv("GITEA_WORK_DIR")}
-	}
-	if len(os.Getenv("GITEA_CUSTOM")) > 0 {
-		envVars["GITEA_CUSTOM"] = &envVar{"GITEA_CUSTOM", os.Getenv("GITEA_CUSTOM")}
-	}
-
-	ctx.Data["EnvVars"] = envVars
-	ctx.Data["Loggers"] = setting.GetLogDescriptions()
-	ctx.Data["EnableAccessLog"] = setting.Log.EnableAccessLog
 	ctx.Data["AccessLogTemplate"] = setting.Log.AccessLogTemplate
-	ctx.Data["DisableRouterLog"] = setting.Log.DisableRouterLog
-	ctx.Data["EnableXORMLog"] = setting.Log.EnableXORMLog
 	ctx.Data["LogSQL"] = setting.Database.LogSQL
+
+	ctx.Data["Loggers"] = log.GetManager().DumpLoggers()
+	config.GetDynGetter().InvalidateCache()
+	prepareStartupProblemsAlert(ctx)
 
 	ctx.HTML(http.StatusOK, tplConfig)
 }
 
-func ChangeConfig(ctx *context.Context) {
-	key := strings.TrimSpace(ctx.FormString("key"))
-	if key == "" {
-		ctx.JSON(http.StatusOK, map[string]string{
-			"redirect": ctx.Req.URL.String(),
-		})
-		return
-	}
-	value := ctx.FormString("value")
-	version := ctx.FormInt("version")
-
-	if check, ok := changeConfigChecks[key]; ok {
-		if err := check(ctx, value); err != nil {
-			log.Warn("refused to set setting: %v", err)
-			ctx.JSON(http.StatusOK, map[string]string{
-				"err": ctx.Tr("admin.config.set_setting_failed", key),
-			})
-			return
-		}
-	}
-
-	if err := system_model.SetSetting(ctx, &system_model.Setting{
-		SettingKey:   key,
-		SettingValue: value,
-		Version:      version,
-	}); err != nil {
-		log.Error("set setting failed: %v", err)
-		ctx.JSON(http.StatusOK, map[string]string{
-			"err": ctx.Tr("admin.config.set_setting_failed", key),
-		})
-		return
-	}
-
-	ctx.JSON(http.StatusOK, map[string]interface{}{
-		"version": version + 1,
-	})
+func ConfigSettings(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("admin.config_settings")
+	ctx.Data["PageIsAdminConfig"] = true
+	ctx.Data["PageIsAdminConfigSettings"] = true
+	ctx.HTML(http.StatusOK, tplConfigSettings)
 }
 
-var changeConfigChecks = map[string]func(ctx *context.Context, newValue string) error{
-	system_model.KeyPictureDisableGravatar: func(_ *context.Context, newValue string) error {
-		if v, _ := strconv.ParseBool(newValue); setting.OfflineMode && !v {
-			return fmt.Errorf("%q should be true when OFFLINE_MODE is true", system_model.KeyPictureDisableGravatar)
+func validateConfigKeyValue(dynKey, input string) error {
+	opt := config.GetConfigOption(dynKey)
+	if opt == nil {
+		return util.NewInvalidArgumentErrorf("unknown config key: %s", dynKey)
+	}
+
+	const limit = 64 * 1024
+	if len(input) > limit {
+		return util.NewInvalidArgumentErrorf("value length exceeds limit of %d", limit)
+	}
+
+	if !json.Valid([]byte(input)) {
+		return util.NewInvalidArgumentErrorf("invalid json value for key: %s", dynKey)
+	}
+	return nil
+}
+
+func ChangeConfig(ctx *context.Context) {
+	_ = ctx.Req.ParseForm()
+	configKeys := ctx.Req.Form["key"]
+	configValues := ctx.Req.Form["value"]
+	configSettings := map[string]string{}
+loop:
+	for i, key := range configKeys {
+		if i >= len(configValues) {
+			ctx.JSONError(ctx.Tr("admin.config.set_setting_failed", key))
+			break loop
 		}
-		return nil
-	},
-	system_model.KeyPictureEnableFederatedAvatar: func(_ *context.Context, newValue string) error {
-		if v, _ := strconv.ParseBool(newValue); setting.OfflineMode && v {
-			return fmt.Errorf("%q cannot be false when OFFLINE_MODE is true", system_model.KeyPictureEnableFederatedAvatar)
+		value := configValues[i]
+
+		err := validateConfigKeyValue(key, value)
+		if err != nil {
+			ctx.JSONErrorAuto(err)
+			break loop
 		}
-		return nil
-	},
+		configSettings[key] = value
+	}
+	if ctx.Written() {
+		return
+	}
+	if err := system_model.SetSettings(ctx, configSettings); err != nil {
+		ctx.ServerErrorAuto(err)
+		return
+	}
+	config.GetDynGetter().InvalidateCache()
+	ctx.JSONOK()
 }

@@ -10,9 +10,12 @@ import (
 
 // ReleaseAsset represents a release asset
 type ReleaseAsset struct {
-	ID            int64
-	Name          string
-	ContentType   *string `yaml:"content_type"`
+	ID   int64
+	Name string
+
+	// There was a field "ContentType (content_type)" because Some forges can provide that for assets,
+	// but we don't need it when migrating, so the field is omitted here.
+
 	Size          *int
 	DownloadCount *int `yaml:"download_count"`
 	Created       time.Time
@@ -31,6 +34,7 @@ type Release struct {
 	Body            string
 	Draft           bool
 	Prerelease      bool
+	Latest          bool
 	PublisherID     int64  `yaml:"publisher_id"`
 	PublisherName   string `yaml:"publisher_name"`
 	PublisherEmail  string `yaml:"publisher_email"`

@@ -4,42 +4,28 @@
 package private
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
-	"strings"
 
-	issues_model "code.gitea.io/gitea/models/issues"
-	repo_model "code.gitea.io/gitea/models/repo"
-	gitea_context "code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/private"
-	repo_module "code.gitea.io/gitea/modules/repository"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/modules/web"
-	repo_service "code.gitea.io/gitea/services/repository"
+	audit_model "gitea.dev/models/audit"
+	issues_model "gitea.dev/models/issues"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/private"
+	repo_module "gitea.dev/modules/repository"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/audit"
+	gitea_context "gitea.dev/services/context"
+	pull_service "gitea.dev/services/pull"
+	repo_service "gitea.dev/services/repository"
 )
 
-// HookPostReceive updates services and users
-func HookPostReceive(ctx *gitea_context.PrivateContext) {
-	opts := web.GetForm(ctx).(*private.HookOptions)
-
-	// We don't rely on RepoAssignment here because:
-	// a) we don't need the git repo in this function
-	// b) our update function will likely change the repository in the db so we will need to refresh it
-	// c) we don't always need the repo
-
-	ownerName := ctx.Params(":owner")
-	repoName := ctx.Params(":repo")
-
-	// defer getting the repository at this point - as we should only retrieve it if we're going to call update
-	var repo *repo_model.Repository
-
+func hookPostReceiveCollectPushUpdates(opts *private.HookOptions, repo *repo_model.Repository) []*repo_module.PushUpdateOptions {
 	updates := make([]*repo_module.PushUpdateOptions, 0, len(opts.OldCommitIDs))
-	wasEmpty := false
-
 	for i := range opts.OldCommitIDs {
 		refFullName := opts.RefFullNames[i]
 
@@ -47,186 +33,169 @@ func HookPostReceive(ctx *gitea_context.PrivateContext) {
 		// tags.  Updates to other refs (eg, refs/notes, refs/changes,
 		// or other less-standard refs spaces are ignored since there
 		// may be a very large number of them).
-		if strings.HasPrefix(refFullName, git.BranchPrefix) || strings.HasPrefix(refFullName, git.TagPrefix) {
-			if repo == nil {
-				repo = loadRepository(ctx, ownerName, repoName)
-				if ctx.Written() {
-					// Error handled in loadRepository
-					return
-				}
-				wasEmpty = repo.IsEmpty
-			}
-
+		if refFullName.IsBranch() || refFullName.IsTag() {
 			option := &repo_module.PushUpdateOptions{
 				RefFullName:  refFullName,
 				OldCommitID:  opts.OldCommitIDs[i],
 				NewCommitID:  opts.NewCommitIDs[i],
 				PusherID:     opts.UserID,
 				PusherName:   opts.UserName,
-				RepoUserName: ownerName,
-				RepoName:     repoName,
+				RepoUserName: repo.OwnerName,
+				RepoName:     repo.Name,
 			}
 			updates = append(updates, option)
-			if repo.IsEmpty && option.IsBranch() && (option.BranchName() == "master" || option.BranchName() == "main") {
-				// put the master/main branch first
-				copy(updates[1:], updates)
-				updates[0] = option
-			}
+		}
+	}
+	return updates
+}
+
+func hookPostReceiveSyncDatabaseBranches(ctx *gitea_context.PrivateContext, opts *private.HookOptions, repo *repo_model.Repository, updates []*repo_module.PushUpdateOptions) {
+	branchNames := make([]string, 0, len(updates))
+	for _, update := range updates {
+		if !update.RefFullName.IsBranch() {
+			continue
+		}
+		branchNames = append(branchNames, update.RefFullName.BranchName())
+		if !update.IsDelRef() {
+			pull_service.UpdatePullsRefs(ctx, repo, update)
 		}
 	}
 
-	if repo != nil && len(updates) > 0 {
-		if err := repo_service.PushUpdates(updates); err != nil {
-			log.Error("Failed to Update: %s/%s Total Updates: %d", ownerName, repoName, len(updates))
-			for i, update := range updates {
-				log.Error("Failed to Update: %s/%s Update: %d/%d: Branch: %s", ownerName, repoName, i, len(updates), update.BranchName())
-			}
-			log.Error("Failed to Update: %s/%s Error: %v", ownerName, repoName, err)
+	if len(branchNames) == 0 {
+		return
+	}
 
-			ctx.JSON(http.StatusInternalServerError, private.HookPostReceiveResult{
-				Err: fmt.Sprintf("Failed to Update: %s/%s Error: %v", ownerName, repoName, err),
-			})
+	gitRepo, err := git.RepositoryFromRequestContextOrOpen(ctx, repo)
+	if err != nil {
+		log.Error("failed to open git repo: %v", err)
+		return
+	}
+
+	if err = repo_service.SyncBranchesToDB(ctx, repo, opts.UserID, gitRepo, branchNames); err != nil {
+		log.Error("failed to sync branch to DB: %v", err)
+	}
+}
+
+// HookPostReceive updates services and users
+func HookPostReceive(ctx *gitea_context.PrivateContext) {
+	opts := web.GetForm[*private.HookOptions](ctx)
+	if opts.IsWiki {
+		setting.PanicInDevOrTesting("wiki hook-post-receive is not supported")
+		return
+	}
+
+	// In the post-receive hook, the git repo has received all changes,
+	// So even if any error happens, nothing can be stopped or undone, so the errors should be skipped
+	repo := ctx.Repo.Repository
+	wasEmpty := repo.IsEmpty
+	updates := hookPostReceiveCollectPushUpdates(opts, repo)
+	hookPostReceiveUpdateRepoByOptions(ctx, opts, repo) // push options are only honored while the repo is still empty
+	hookPostReceiveSyncDatabaseBranches(ctx, opts, repo, updates)
+
+	// handle async updates (e.g.: notification, cache management, repo update time, etc.)
+	if err := repo_service.PushUpdates(updates...); err != nil {
+		log.Error("failed to push updates: %v", err)
+	}
+
+	if wasEmpty && !repo.IsFork {
+		ctx.JSON(http.StatusOK, private.HookPostReceiveResult{})
+		return
+	}
+	hookPostReceiveRespondWithTrailer(ctx, opts, repo)
+}
+
+func hookPostReceiveUpdateRepoByOptions(ctx *gitea_context.PrivateContext, opts *private.HookOptions, repo *repo_model.Repository) {
+	isPrivate := opts.GitPushOptions.Bool(private.GitPushOptionRepoPrivate)
+	isTemplate := opts.GitPushOptions.Bool(private.GitPushOptionRepoTemplate)
+	// Handle Push Options
+	if !isPrivate.Has() && !isTemplate.Has() {
+		return
+	}
+
+	if !loadContextDoerPermission(ctx, opts.UserID, opts.UserExtDoerData) {
+		return
+	}
+
+	if !ctx.Repo.Permission.IsAdmin() {
+		return
+	}
+
+	// Only honor these options while the repo is still empty (the push-to-create
+	// case). On a populated repo a bare "git push -o repo.private=..." would
+	// silently flip visibility, bypassing the audit log, webhooks and notifications.
+	if !repo.IsEmpty {
+		return
+	}
+
+	// The repo is empty and being initialized by this push, so there is no
+	// dependent state (webhooks, notifications, visibility fan-out) to reconcile
+	// yet; setting the flags directly is sufficient in this push-to-create case.
+	if isPrivate.Has() && repo.IsPrivate != isPrivate.Value() &&
+		(isPrivate.Value() || !setting.Repository.ForcePrivate || ctx.Doer.IsAdmin) {
+		repo.IsPrivate = isPrivate.Value()
+		if err := repo_model.UpdateRepositoryColsNoAutoTime(ctx, repo, "is_private"); err != nil {
+			log.Error("failed to update repo is_private: %v", err)
+		} else {
+			audit.RecordAs(ctx, ctx.Doer, audit_model.RepositoryVisibility, repo, "visibility", repo.IsPrivate)
+		}
+	}
+	if isTemplate.Has() && repo.IsTemplate != isTemplate.Value() {
+		repo.IsTemplate = isTemplate.Value()
+		if err := repo_model.UpdateRepositoryColsNoAutoTime(ctx, repo, "is_template"); err != nil {
+			log.Error("failed to update repo is_template: %v", err)
+		}
+	}
+}
+
+func hookPostReceiveRespondWithTrailer(ctx *gitea_context.PrivateContext, opts *private.HookOptions, repo *repo_model.Repository) {
+	results := make([]private.HookPostReceiveBranchResult, 0, len(opts.OldCommitIDs))
+	baseRepo := repo
+	if repo.IsFork {
+		if err := repo.GetBaseRepo(ctx); err != nil {
+			ctx.PrivateInternalErrorf("failed to load base repo: %v", err)
 			return
 		}
-	}
-
-	// Handle Push Options
-	if len(opts.GitPushOptions) > 0 {
-		// load the repository
-		if repo == nil {
-			repo = loadRepository(ctx, ownerName, repoName)
-			if ctx.Written() {
-				// Error handled in loadRepository
-				return
-			}
-			wasEmpty = repo.IsEmpty
-		}
-
-		repo.IsPrivate = opts.GitPushOptions.Bool(private.GitPushOptionRepoPrivate, repo.IsPrivate)
-		repo.IsTemplate = opts.GitPushOptions.Bool(private.GitPushOptionRepoTemplate, repo.IsTemplate)
-		if err := repo_model.UpdateRepositoryCols(ctx, repo, "is_private", "is_template"); err != nil {
-			log.Error("Failed to Update: %s/%s Error: %v", ownerName, repoName, err)
-			ctx.JSON(http.StatusInternalServerError, private.HookPostReceiveResult{
-				Err: fmt.Sprintf("Failed to Update: %s/%s Error: %v", ownerName, repoName, err),
-			})
+		if repo.BaseRepo.AllowsPulls(ctx) {
+			baseRepo = repo.BaseRepo
 		}
 	}
 
-	results := make([]private.HookPostReceiveBranchResult, 0, len(opts.OldCommitIDs))
-
-	// We have to reload the repo in case its state is changed above
-	repo = nil
-	var baseRepo *repo_model.Repository
+	if !baseRepo.AllowsPulls(ctx) {
+		// We can stop there's no need to go any further
+		ctx.JSON(http.StatusOK, private.HookPostReceiveResult{})
+		return
+	}
 
 	// Now handle the pull request notification trailers
 	for i := range opts.OldCommitIDs {
 		refFullName := opts.RefFullNames[i]
 		newCommitID := opts.NewCommitIDs[i]
 
-		// post update for agit pull request
-		if git.SupportProcReceive && strings.HasPrefix(refFullName, git.PullPrefix) {
-			if repo == nil {
-				repo = loadRepository(ctx, ownerName, repoName)
-				if ctx.Written() {
-					return
-				}
-			}
-
-			pullIndexStr := strings.TrimPrefix(refFullName, git.PullPrefix)
-			pullIndexStr = strings.Split(pullIndexStr, "/")[0]
-			pullIndex, _ := strconv.ParseInt(pullIndexStr, 10, 64)
-			if pullIndex <= 0 {
-				continue
-			}
-
-			pr, err := issues_model.GetPullRequestByIndex(ctx, repo.ID, pullIndex)
-			if err != nil && !issues_model.IsErrPullRequestNotExist(err) {
-				log.Error("Failed to get PR by index %v Error: %v", pullIndex, err)
-				ctx.JSON(http.StatusInternalServerError, private.Response{
-					Err: fmt.Sprintf("Failed to get PR by index %v Error: %v", pullIndex, err),
-				})
-				return
-			}
-			if pr == nil {
-				continue
-			}
-
-			results = append(results, private.HookPostReceiveBranchResult{
-				Message: setting.Git.PullRequestPushMessage && repo.AllowsPulls(),
-				Create:  false,
-				Branch:  "",
-				URL:     fmt.Sprintf("%s/pulls/%d", repo.HTMLURL(), pr.Index),
-			})
-			continue
-		}
-
-		branch := git.RefEndName(opts.RefFullNames[i])
-
 		// If we've pushed a branch (and not deleted it)
-		if newCommitID != git.EmptySHA && strings.HasPrefix(refFullName, git.BranchPrefix) {
+		if !git.IsEmptyCommitID(newCommitID) && refFullName.IsBranch() {
+			branch := refFullName.BranchName()
 
-			// First ensure we have the repository loaded, we're allowed pulls requests and we can get the base repo
-			if repo == nil {
-				repo = loadRepository(ctx, ownerName, repoName)
-				if ctx.Written() {
-					return
-				}
-
-				baseRepo = repo
-
-				if repo.IsFork {
-					if err := repo.GetBaseRepo(ctx); err != nil {
-						log.Error("Failed to get Base Repository of Forked repository: %-v Error: %v", repo, err)
-						ctx.JSON(http.StatusInternalServerError, private.HookPostReceiveResult{
-							Err:          fmt.Sprintf("Failed to get Base Repository of Forked repository: %-v Error: %v", repo, err),
-							RepoWasEmpty: wasEmpty,
-						})
-						return
-					}
-					if repo.BaseRepo.AllowsPulls() {
-						baseRepo = repo.BaseRepo
-					}
-				}
-
-				if !baseRepo.AllowsPulls() {
-					// We can stop there's no need to go any further
-					ctx.JSON(http.StatusOK, private.HookPostReceiveResult{
-						RepoWasEmpty: wasEmpty,
-					})
-					return
-				}
-			}
-
-			// If our branch is the default branch of an unforked repo - there's no PR to create or refer to
-			if !repo.IsFork && branch == baseRepo.DefaultBranch {
+			if branch == baseRepo.DefaultBranch && !repo.IsFork {
+				// If our branch is the default branch of an unforked repo - there's no PR to create or refer to
 				results = append(results, private.HookPostReceiveBranchResult{})
 				continue
 			}
 
 			pr, err := issues_model.GetUnmergedPullRequest(ctx, repo.ID, baseRepo.ID, branch, baseRepo.DefaultBranch, issues_model.PullRequestFlowGithub)
-			if err != nil && !issues_model.IsErrPullRequestNotExist(err) {
-				log.Error("Failed to get active PR in: %-v Branch: %s to: %-v Branch: %s Error: %v", repo, branch, baseRepo, baseRepo.DefaultBranch, err)
-				ctx.JSON(http.StatusInternalServerError, private.HookPostReceiveResult{
-					Err: fmt.Sprintf(
-						"Failed to get active PR in: %-v Branch: %s to: %-v Branch: %s Error: %v", repo, branch, baseRepo, baseRepo.DefaultBranch, err),
-					RepoWasEmpty: wasEmpty,
-				})
+			if err != nil && !errors.Is(err, util.ErrNotExist) {
+				ctx.PrivateInternalErrorf("failed to get active PR for branch %s: %v", branch, err)
 				return
 			}
-
 			if pr == nil {
-				if repo.IsFork {
-					branch = fmt.Sprintf("%s:%s", repo.OwnerName, branch)
-				}
 				results = append(results, private.HookPostReceiveBranchResult{
-					Message: setting.Git.PullRequestPushMessage && baseRepo.AllowsPulls(),
+					Message: setting.Git.PullRequestPushMessage && baseRepo.AllowsPulls(ctx),
 					Create:  true,
 					Branch:  branch,
-					URL:     fmt.Sprintf("%s/compare/%s...%s", baseRepo.HTMLURL(), util.PathEscapeSegments(baseRepo.DefaultBranch), util.PathEscapeSegments(branch)),
+					URL:     fmt.Sprintf("%s/pulls/new/%s", repo.HTMLURL(), util.PathEscapeSegments(branch)),
 				})
 			} else {
 				results = append(results, private.HookPostReceiveBranchResult{
-					Message: setting.Git.PullRequestPushMessage && baseRepo.AllowsPulls(),
+					Message: setting.Git.PullRequestPushMessage && baseRepo.AllowsPulls(ctx),
 					Create:  false,
 					Branch:  branch,
 					URL:     fmt.Sprintf("%s/pulls/%d", baseRepo.HTMLURL(), pr.Index),
@@ -234,8 +203,5 @@ func HookPostReceive(ctx *gitea_context.PrivateContext) {
 			}
 		}
 	}
-	ctx.JSON(http.StatusOK, private.HookPostReceiveResult{
-		Results:      results,
-		RepoWasEmpty: wasEmpty,
-	})
+	ctx.JSON(http.StatusOK, private.HookPostReceiveResult{Results: results})
 }

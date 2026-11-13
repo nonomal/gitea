@@ -6,11 +6,11 @@ package repo
 import (
 	"net/http"
 
-	"code.gitea.io/gitea/models"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/services/convert"
-	releaseservice "code.gitea.io/gitea/services/release"
+	repo_model "gitea.dev/models/repo"
+	unit_model "gitea.dev/models/unit"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	release_service "gitea.dev/services/release"
 )
 
 // GetReleaseByTag get a single release of a repository by tag name
@@ -39,31 +39,38 @@ func GetReleaseByTag(ctx *context.APIContext) {
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/Release"
-	//   "404":
-	//     "$ref": "#/responses/notFound"
+	//   default:
+	//     "$ref": "#/responses/error"
 
-	tag := ctx.Params(":tag")
+	tag := ctx.PathParam("tag")
 
-	release, err := repo_model.GetRelease(ctx.Repo.Repository.ID, tag)
+	release, err := repo_model.GetRelease(ctx, ctx.Repo.Repository.ID, tag)
 	if err != nil {
 		if repo_model.IsErrReleaseNotExist(err) {
-			ctx.NotFound()
+			ctx.APIErrorNotFound()
 			return
 		}
-		ctx.Error(http.StatusInternalServerError, "GetRelease", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
 	if release.IsTag {
-		ctx.NotFound()
+		ctx.APIErrorNotFound()
 		return
 	}
 
+	if release.IsDraft { // only the users with write access can see draft releases
+		if !ctx.IsSigned || !ctx.Repo.Permission.CanWrite(unit_model.TypeReleases) {
+			ctx.APIErrorNotFound()
+			return
+		}
+	}
+
 	if err = release.LoadAttributes(ctx); err != nil {
-		ctx.Error(http.StatusInternalServerError, "LoadAttributes", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
-	ctx.JSON(http.StatusOK, convert.ToRelease(ctx, release))
+	ctx.JSON(http.StatusOK, convert.ToAPIRelease(ctx, ctx.Repo.Repository, release))
 }
 
 // DeleteReleaseByTag delete a release from a repository by tag name
@@ -90,34 +97,32 @@ func DeleteReleaseByTag(ctx *context.APIContext) {
 	// responses:
 	//   "204":
 	//     "$ref": "#/responses/empty"
-	//   "404":
-	//     "$ref": "#/responses/notFound"
-	//   "405":
-	//     "$ref": "#/responses/empty"
+	//   default:
+	//     "$ref": "#/responses/error"
 
-	tag := ctx.Params(":tag")
+	tag := ctx.PathParam("tag")
 
-	release, err := repo_model.GetRelease(ctx.Repo.Repository.ID, tag)
+	release, err := repo_model.GetRelease(ctx, ctx.Repo.Repository.ID, tag)
 	if err != nil {
 		if repo_model.IsErrReleaseNotExist(err) {
-			ctx.NotFound()
+			ctx.APIErrorNotFound()
 			return
 		}
-		ctx.Error(http.StatusInternalServerError, "GetRelease", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
 	if release.IsTag {
-		ctx.NotFound()
+		ctx.APIErrorNotFound()
 		return
 	}
 
-	if err = releaseservice.DeleteReleaseByID(ctx, release.ID, ctx.Doer, false); err != nil {
-		if models.IsErrProtectedTagName(err) {
-			ctx.Error(http.StatusMethodNotAllowed, "delTag", "user not allowed to delete protected tag")
+	if err = release_service.DeleteReleaseByID(ctx, ctx.Repo.Repository, release, ctx.Doer, false); err != nil {
+		if release_service.IsErrProtectedTagName(err) {
+			ctx.APIError(http.StatusUnprocessableEntity, "user not allowed to delete protected tag")
 			return
 		}
-		ctx.Error(http.StatusInternalServerError, "DeleteReleaseByID", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 

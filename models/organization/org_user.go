@@ -7,10 +7,10 @@ import (
 	"context"
 	"fmt"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/perm"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/log"
+	"gitea.dev/models/db"
+	"gitea.dev/models/perm"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
 
 	"xorm.io/builder"
 )
@@ -34,11 +34,33 @@ func init() {
 	db.RegisterModel(new(OrgUser))
 }
 
+// ErrUserHasOrgs represents a "UserHasOrgs" kind of error.
+type ErrUserHasOrgs struct {
+	UID int64
+}
+
+// IsErrUserHasOrgs checks if an error is a ErrUserHasOrgs.
+func IsErrUserHasOrgs(err error) bool {
+	_, ok := err.(ErrUserHasOrgs)
+	return ok
+}
+
+func (err ErrUserHasOrgs) Error() string {
+	return fmt.Sprintf("user still has membership of organizations [uid: %d]", err.UID)
+}
+
 // GetOrganizationCount returns count of membership of organization of the user.
 func GetOrganizationCount(ctx context.Context, u *user_model.User) (int64, error) {
 	return db.GetEngine(ctx).
 		Where("uid=?", u.ID).
 		Count(new(OrgUser))
+}
+
+func GetUserOrganizations(ctx context.Context, uid int64) (ret []*Organization, err error) {
+	err = db.GetEngine(ctx).Select("`user`.*").
+		Join("INNER", "org_user", "org_user.org_id = `user`.id").
+		Where("org_user.uid=?", uid).Find(&ret)
+	return ret, err
 }
 
 // IsOrganizationOwner returns true if given user is in the owner team.
@@ -54,20 +76,6 @@ func IsOrganizationOwner(ctx context.Context, orgID, uid int64) (bool, error) {
 	return IsTeamMember(ctx, orgID, ownerTeam.ID, uid)
 }
 
-// IsOrganizationAdmin returns true if given user is in the owner team or an admin team.
-func IsOrganizationAdmin(ctx context.Context, orgID, uid int64) (bool, error) {
-	teams, err := GetUserOrgTeams(ctx, orgID, uid)
-	if err != nil {
-		return false, err
-	}
-	for _, t := range teams {
-		if t.AccessMode >= perm.AccessModeAdmin {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 // IsOrganizationMember returns true if given user is member of organization.
 func IsOrganizationMember(ctx context.Context, orgID, uid int64) (bool, error) {
 	return db.GetEngine(ctx).
@@ -78,8 +86,8 @@ func IsOrganizationMember(ctx context.Context, orgID, uid int64) (bool, error) {
 }
 
 // IsPublicMembership returns true if the given user's membership of given org is public.
-func IsPublicMembership(orgID, uid int64) (bool, error) {
-	return db.GetEngine(db.DefaultContext).
+func IsPublicMembership(ctx context.Context, orgID, uid int64) (bool, error) {
+	return db.GetEngine(ctx).
 		Where("uid=?", uid).
 		And("org_id=?", orgID).
 		And("is_public=?", true).
@@ -90,7 +98,7 @@ func IsPublicMembership(orgID, uid int64) (bool, error) {
 // CanCreateOrgRepo returns true if user can create repo in organization
 func CanCreateOrgRepo(ctx context.Context, orgID, uid int64) (bool, error) {
 	return db.GetEngine(ctx).
-		Where(builder.Eq{"team.can_create_org_repo": true}).
+		Where(builder.Eq{"team.can_create_org_repo": true}.Or(builder.Eq{"team.authorize": perm.AccessModeOwner})).
 		Join("INNER", "team_user", "team_user.team_id = team.id").
 		And("team_user.uid = ?", uid).
 		And("team_user.org_id = ?", orgID).
@@ -98,12 +106,12 @@ func CanCreateOrgRepo(ctx context.Context, orgID, uid int64) (bool, error) {
 }
 
 // IsUserOrgOwner returns true if user is in the owner team of given organization.
-func IsUserOrgOwner(users user_model.UserList, orgID int64) map[int64]bool {
+func IsUserOrgOwner(ctx context.Context, users user_model.UserList, orgID int64) map[int64]bool {
 	results := make(map[int64]bool, len(users))
 	for _, user := range users {
 		results[user.ID] = false // Set default to false
 	}
-	ownerMaps, err := loadOrganizationOwners(db.DefaultContext, users, orgID)
+	ownerMaps, err := loadOrganizationOwners(ctx, users, orgID)
 	if err == nil {
 		for _, owner := range ownerMaps {
 			results[owner.UID] = true
@@ -114,13 +122,13 @@ func IsUserOrgOwner(users user_model.UserList, orgID int64) map[int64]bool {
 
 func loadOrganizationOwners(ctx context.Context, users user_model.UserList, orgID int64) (map[int64]*TeamUser, error) {
 	if len(users) == 0 {
-		return nil, nil
+		return nil, nil //nolint:nilnil // return nil when there are no users
 	}
 	ownerTeam, err := GetOwnerTeam(ctx, orgID)
 	if err != nil {
 		if IsErrTeamNotExist(err) {
 			log.Error("Organization does not have owner team: %d", orgID)
-			return nil, nil
+			return nil, nil //nolint:nilnil // return nil when owner team does not exist
 		}
 		return nil, err
 	}

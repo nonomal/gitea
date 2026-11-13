@@ -11,7 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"code.gitea.io/gitea/modules/json"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -29,7 +31,7 @@ func (a *DummyTransferAdapter) Name() string {
 }
 
 func (a *DummyTransferAdapter) Download(ctx context.Context, l *Link) (io.ReadCloser, error) {
-	return io.NopCloser(bytes.NewBufferString("dummy")), nil
+	return io.NopCloser(strings.NewReader("dummy")), nil
 }
 
 func (a *DummyTransferAdapter) Upload(ctx context.Context, l *Link, p Pointer, r io.Reader) error {
@@ -46,14 +48,27 @@ func lfsTestRoundtripHandler(req *http.Request) *http.Response {
 
 	if strings.Contains(url, "status-not-ok") {
 		return &http.Response{StatusCode: http.StatusBadRequest}
+	} else if strings.Contains(url, "plaintext-error") {
+		return &http.Response{StatusCode: http.StatusNotFound, Status: "404 Not Found", Body: io.NopCloser(strings.NewReader("Not Found"))}
 	} else if strings.Contains(url, "invalid-json-response") {
-		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewBufferString("invalid json"))}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("invalid json"))}
 	} else if strings.Contains(url, "valid-batch-request-download") {
 		batchResponse = &BatchResponse{
 			Transfer: "dummy",
 			Objects: []*ObjectResponse{
 				{
 					Actions: map[string]*Link{
+						"download": {},
+					},
+				},
+			},
+		}
+	} else if strings.Contains(url, "legacy-batch-request-download") {
+		batchResponse = &BatchResponse{
+			Transfer: "dummy",
+			Objects: []*ObjectResponse{
+				{
+					Links: map[string]*Link{
 						"download": {},
 					},
 				},
@@ -149,210 +164,115 @@ func lfsTestRoundtripHandler(req *http.Request) *http.Response {
 	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(payload)}
 }
 
-func TestHTTPClientDownload(t *testing.T) {
-	p := Pointer{Oid: "fb8f7d8435968c4f82a726a92395be4d16f2f63116caf36c8ad35c60831ab041", Size: 6}
-
-	hc := &http.Client{Transport: RoundTripFunc(func(req *http.Request) *http.Response {
-		assert.Equal(t, "POST", req.Method)
-		assert.Equal(t, MediaType, req.Header.Get("Content-type"))
-		assert.Equal(t, MediaType, req.Header.Get("Accept"))
-
-		var batchRequest BatchRequest
-		err := json.NewDecoder(req.Body).Decode(&batchRequest)
-		assert.NoError(t, err)
-
-		assert.Equal(t, "download", batchRequest.Operation)
-		assert.Len(t, batchRequest.Objects, 1)
-		assert.Equal(t, p.Oid, batchRequest.Objects[0].Oid)
-		assert.Equal(t, p.Size, batchRequest.Objects[0].Size)
-
-		return lfsTestRoundtripHandler(req)
-	})}
-	dummy := &DummyTransferAdapter{}
-
-	cases := []struct {
+func TestHTTPClientTransfers(t *testing.T) {
+	type clientCase struct {
 		endpoint      string
-		expectederror string
-	}{
-		// case 0
-		{
-			endpoint:      "https://status-not-ok.io",
-			expectederror: "Unexpected server response: ",
-		},
-		// case 1
-		{
-			endpoint:      "https://invalid-json-response.io",
-			expectederror: "invalid json",
-		},
-		// case 2
-		{
-			endpoint:      "https://valid-batch-request-download.io",
-			expectederror: "",
-		},
-		// case 3
-		{
-			endpoint:      "https://response-no-objects.io",
-			expectederror: "",
-		},
-		// case 4
-		{
-			endpoint:      "https://unknown-transfer-adapter.io",
-			expectederror: "TransferAdapter not found: ",
-		},
-		// case 5
-		{
-			endpoint:      "https://error-in-response-objects.io",
-			expectederror: "Object not found",
-		},
-		// case 6
-		{
-			endpoint:      "https://empty-actions-map.io",
-			expectederror: "Missing action 'download'",
-		},
-		// case 7
-		{
-			endpoint:      "https://download-actions-map.io",
-			expectederror: "",
-		},
-		// case 8
-		{
-			endpoint:      "https://upload-actions-map.io",
-			expectederror: "Missing action 'download'",
-		},
-		// case 9
-		{
-			endpoint:      "https://verify-actions-map.io",
-			expectederror: "Missing action 'download'",
-		},
-		// case 10
-		{
-			endpoint:      "https://unknown-actions-map.io",
-			expectederror: "Missing action 'download'",
-		},
+		expectedError string
 	}
+	for _, operation := range []struct {
+		name  string
+		cases []clientCase
+	}{
+		{
+			name: "download",
+			cases: []clientCase{
+				{"https://status-not-ok.io", `LFS server returned error, status: 400, body: ""`},
+				{"https://plaintext-error.io", `LFS server returned error, status: 404, body: "Not Found"`},
+				{"https://invalid-json-response.io", "/(invalid json|invalid character)/"},
+				{"https://valid-batch-request-download.io", ""},
+				{"https://response-no-objects.io", ""},
+				{"https://unknown-transfer-adapter.io", "TransferAdapter not found: "},
+				{"https://error-in-response-objects.io", "Object not found"},
+				{"https://empty-actions-map.io", "missing action 'download'"},
+				{"https://download-actions-map.io", ""},
+				{"https://upload-actions-map.io", "missing action 'download'"},
+				{"https://verify-actions-map.io", "missing action 'download'"},
+				{"https://unknown-actions-map.io", "missing action 'download'"},
+				{"https://legacy-batch-request-download.io", ""},
+			},
+		},
+		{
+			name: "upload",
+			cases: []clientCase{
+				{"https://status-not-ok.io", `LFS server returned error, status: 400, body: ""`},
+				{"https://plaintext-error.io", `LFS server returned error, status: 404, body: "Not Found"`},
+				{"https://invalid-json-response.io", "/(invalid json|invalid character)/"},
+				{"https://valid-batch-request-upload.io", ""},
+				{"https://response-no-objects.io", ""},
+				{"https://unknown-transfer-adapter.io", "TransferAdapter not found: "},
+				{"https://error-in-response-objects.io", "Object not found"},
+				{"https://empty-actions-map.io", ""},
+				{"https://download-actions-map.io", "missing action 'upload'"},
+				{"https://upload-actions-map.io", ""},
+				{"https://verify-actions-map.io", "missing action 'upload'"},
+				{"https://unknown-actions-map.io", "missing action 'upload'"},
+			},
+		},
+	} {
+		t.Run(operation.name, func(t *testing.T) {
+			p := Pointer{Oid: "fb8f7d8435968c4f82a726a92395be4d16f2f63116caf36c8ad35c60831ab041", Size: 6}
 
-	for n, c := range cases {
-		client := &HTTPClient{
-			client:    hc,
-			endpoint:  c.endpoint,
-			transfers: make(map[string]TransferAdapter),
-		}
-		client.transfers["dummy"] = dummy
+			hc := &http.Client{Transport: RoundTripFunc(func(req *http.Request) *http.Response {
+				assert.Equal(t, "POST", req.Method)
+				assert.Equal(t, MediaType, req.Header.Get("Content-type"))
+				assert.Equal(t, AcceptHeader, req.Header.Get("Accept"))
 
-		err := client.Download(context.Background(), []Pointer{p}, func(p Pointer, content io.ReadCloser, objectError error) error {
-			if objectError != nil {
-				return objectError
+				var batchRequest BatchRequest
+				err := json.NewDecoder(req.Body).Decode(&batchRequest)
+				assert.NoError(t, err)
+
+				assert.Equal(t, operation.name, batchRequest.Operation)
+				if operation.name == "download" {
+					assert.Equal(t, &Reference{Name: "refs/heads/main"}, batchRequest.Ref)
+				} else {
+					assert.Nil(t, batchRequest.Ref)
+				}
+				assert.Len(t, batchRequest.Objects, 1)
+				assert.Equal(t, p.Oid, batchRequest.Objects[0].Oid)
+				assert.Equal(t, p.Size, batchRequest.Objects[0].Size)
+
+				return lfsTestRoundtripHandler(req)
+			})}
+			dummy := &DummyTransferAdapter{}
+
+			defer test.MockVariableValue(&setting.LFSClient.BatchOperationConcurrency, 8)()
+			for _, testCase := range operation.cases {
+				t.Run(testCase.endpoint, func(t *testing.T) {
+					client := &HTTPClient{
+						client:   hc,
+						endpoint: testCase.endpoint,
+						transfers: map[string]TransferAdapter{
+							"dummy": dummy,
+						},
+					}
+
+					var err error
+					if operation.name == "download" {
+						err = client.Download(t.Context(), "refs/heads/main", []Pointer{p}, func(p Pointer, content io.ReadCloser, objectError error) error {
+							if objectError != nil {
+								return objectError
+							}
+							b, err := io.ReadAll(content)
+							assert.NoError(t, err)
+							assert.Equal(t, []byte("dummy"), b)
+							return nil
+						})
+					} else {
+						err = client.Upload(t.Context(), []Pointer{p}, func(p Pointer, objectError error) (io.ReadCloser, error) {
+							return io.NopCloser(new(bytes.Buffer)), objectError
+						})
+					}
+					if testCase.expectedError != "" {
+						if strings.HasPrefix(testCase.expectedError, "/") && strings.HasSuffix(testCase.expectedError, "/") {
+							assert.Regexp(t, strings.Trim(testCase.expectedError, "/"), err.Error())
+						} else {
+							assert.ErrorContains(t, err, testCase.expectedError)
+						}
+					} else {
+						assert.NoError(t, err)
+					}
+				})
 			}
-			b, err := io.ReadAll(content)
-			assert.NoError(t, err)
-			assert.Equal(t, []byte("dummy"), b)
-			return nil
 		})
-		if len(c.expectederror) > 0 {
-			assert.True(t, strings.Contains(err.Error(), c.expectederror), "case %d: '%s' should contain '%s'", n, err.Error(), c.expectederror)
-		} else {
-			assert.NoError(t, err, "case %d", n)
-		}
-	}
-}
-
-func TestHTTPClientUpload(t *testing.T) {
-	p := Pointer{Oid: "fb8f7d8435968c4f82a726a92395be4d16f2f63116caf36c8ad35c60831ab041", Size: 6}
-
-	hc := &http.Client{Transport: RoundTripFunc(func(req *http.Request) *http.Response {
-		assert.Equal(t, "POST", req.Method)
-		assert.Equal(t, MediaType, req.Header.Get("Content-type"))
-		assert.Equal(t, MediaType, req.Header.Get("Accept"))
-
-		var batchRequest BatchRequest
-		err := json.NewDecoder(req.Body).Decode(&batchRequest)
-		assert.NoError(t, err)
-
-		assert.Equal(t, "upload", batchRequest.Operation)
-		assert.Len(t, batchRequest.Objects, 1)
-		assert.Equal(t, p.Oid, batchRequest.Objects[0].Oid)
-		assert.Equal(t, p.Size, batchRequest.Objects[0].Size)
-
-		return lfsTestRoundtripHandler(req)
-	})}
-	dummy := &DummyTransferAdapter{}
-
-	cases := []struct {
-		endpoint      string
-		expectederror string
-	}{
-		// case 0
-		{
-			endpoint:      "https://status-not-ok.io",
-			expectederror: "Unexpected server response: ",
-		},
-		// case 1
-		{
-			endpoint:      "https://invalid-json-response.io",
-			expectederror: "invalid json",
-		},
-		// case 2
-		{
-			endpoint:      "https://valid-batch-request-upload.io",
-			expectederror: "",
-		},
-		// case 3
-		{
-			endpoint:      "https://response-no-objects.io",
-			expectederror: "",
-		},
-		// case 4
-		{
-			endpoint:      "https://unknown-transfer-adapter.io",
-			expectederror: "TransferAdapter not found: ",
-		},
-		// case 5
-		{
-			endpoint:      "https://error-in-response-objects.io",
-			expectederror: "Object not found",
-		},
-		// case 6
-		{
-			endpoint:      "https://empty-actions-map.io",
-			expectederror: "",
-		},
-		// case 7
-		{
-			endpoint:      "https://download-actions-map.io",
-			expectederror: "Missing action 'upload'",
-		},
-		// case 8
-		{
-			endpoint:      "https://upload-actions-map.io",
-			expectederror: "",
-		},
-		// case 9
-		{
-			endpoint:      "https://verify-actions-map.io",
-			expectederror: "Missing action 'upload'",
-		},
-		// case 10
-		{
-			endpoint:      "https://unknown-actions-map.io",
-			expectederror: "Missing action 'upload'",
-		},
-	}
-
-	for n, c := range cases {
-		client := &HTTPClient{
-			client:    hc,
-			endpoint:  c.endpoint,
-			transfers: make(map[string]TransferAdapter),
-		}
-		client.transfers["dummy"] = dummy
-
-		err := client.Upload(context.Background(), []Pointer{p}, func(p Pointer, objectError error) (io.ReadCloser, error) {
-			return io.NopCloser(new(bytes.Buffer)), objectError
-		})
-		if len(c.expectederror) > 0 {
-			assert.True(t, strings.Contains(err.Error(), c.expectederror), "case %d: '%s' should contain '%s'", n, err.Error(), c.expectederror)
-		} else {
-			assert.NoError(t, err, "case %d", n)
-		}
 	}
 }

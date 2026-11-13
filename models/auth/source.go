@@ -5,14 +5,19 @@
 package auth
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/timeutil"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
 
+	"xorm.io/builder"
 	"xorm.io/xorm"
 	"xorm.io/xorm/convert"
 )
@@ -55,6 +60,41 @@ var Names = map[Type]string{
 // Config represents login config as far as the db is concerned
 type Config interface {
 	convert.Conversion
+	SetAuthSource(*Source)
+	GetAuthSource() *Source
+}
+
+type ConfigBase struct {
+	AuthSource *Source `json:"-"`
+}
+
+func (c *ConfigBase) SetAuthSource(source *Source) {
+	c.AuthSource = source
+}
+
+func (c *ConfigBase) GetAuthSource() *Source {
+	return c.AuthSource
+}
+
+func UnmarshalAuthSourceConfig(bs []byte, v Config) {
+	if db.UnmarshalFromDB(bs, &v) {
+		return
+	}
+	// This is only a workaround because we don't know whether this unmarshal happens on sign-in page or admin panel.
+	// * Admin should have the chance to edit the auth source in admin panel, so FromDB should not return an error
+	// * The sign-in page should not use the auth source in the next login attempt, but we don't have a clear way to disable it immediately (acceptable)
+	// Actually, corrupted database value is a really rare case, just because AI thinks it should be handled.
+	authSourceID := v.GetAuthSource().ID
+	log.Error("Unable to unmarshal login source id=%d, will mark it as inactive to avoid unexpected sign-in issues", authSourceID)
+	go graceful.GetManager().RunWithShutdownContext(func(ctx context.Context) {
+		// A small time window to avoid race condition with admin's editing because there is no other way.
+		// The UpdateUnix field is not filled when this function is called.
+		_, err := db.GetEngine(ctx).ID(authSourceID).And("is_active = ? AND updated_unix < ?", true, timeutil.TimeStampNow()-5).
+			Cols("is_active").Update(&Source{IsActive: false})
+		if err != nil {
+			log.Error("Unable to set login source id=%d to inactive: %v", authSourceID, err)
+		}
+	})
 }
 
 // SkipVerifiable configurations provide a IsSkipVerify to check if SkipVerify is set
@@ -85,35 +125,23 @@ type RegisterableSource interface {
 
 var registeredConfigs = map[Type]func() Config{}
 
-// RegisterTypeConfig register a config for a provided type
-func RegisterTypeConfig(typ Type, exemplar Config) {
-	if reflect.TypeOf(exemplar).Kind() == reflect.Ptr {
-		// Pointer:
-		registeredConfigs[typ] = func() Config {
-			return reflect.New(reflect.ValueOf(exemplar).Elem().Type()).Interface().(Config)
-		}
-		return
-	}
-
-	// Not a Pointer
-	registeredConfigs[typ] = func() Config {
-		return reflect.New(reflect.TypeOf(exemplar)).Elem().Interface().(Config)
-	}
-}
-
-// SourceSettable configurations can have their authSource set on them
-type SourceSettable interface {
-	SetAuthSource(*Source)
+// RegisterTypeConfig register a config for a provided type, the exemplar argument only serves type inference
+func RegisterTypeConfig[T interface {
+	*E
+	Config
+}, E any](typ Type, _ T) {
+	registeredConfigs[typ] = func() Config { return T(new(E)) }
 }
 
 // Source represents an external way for authorizing users.
 type Source struct {
-	ID            int64 `xorm:"pk autoincr"`
-	Type          Type
-	Name          string             `xorm:"UNIQUE"`
-	IsActive      bool               `xorm:"INDEX NOT NULL DEFAULT false"`
-	IsSyncEnabled bool               `xorm:"INDEX NOT NULL DEFAULT false"`
-	Cfg           convert.Conversion `xorm:"TEXT"`
+	ID              int64 `xorm:"pk autoincr"`
+	Type            Type
+	Name            string `xorm:"UNIQUE"` // it can be the OIDC's provider name, see services/auth/source/oauth2/source_register.go: RegisterSource
+	IsActive        bool   `xorm:"INDEX NOT NULL DEFAULT false"`
+	IsSyncEnabled   bool   `xorm:"INDEX NOT NULL DEFAULT false"`
+	TwoFactorPolicy string `xorm:"two_factor_policy NOT NULL DEFAULT ''"`
+	Cfg             Config `xorm:"TEXT"`
 
 	CreatedUnix timeutil.TimeStamp `xorm:"INDEX created"`
 	UpdatedUnix timeutil.TimeStamp `xorm:"INDEX updated"`
@@ -131,15 +159,16 @@ func init() {
 // BeforeSet is invoked from XORM before setting the value of a field of this object.
 func (source *Source) BeforeSet(colName string, val xorm.Cell) {
 	if colName == "type" {
-		typ := Type(db.Cell2Int64(val))
+		typ, _, err := db.CellToInt(val, NoType)
+		if err != nil {
+			setting.PanicInDevOrTesting("Unable to convert login source (id=%d) type: %v", source.ID, err)
+		}
 		constructor, ok := registeredConfigs[typ]
 		if !ok {
 			return
 		}
 		source.Cfg = constructor()
-		if settable, ok := source.Cfg.(SourceSettable); ok {
-			settable.SetAuthSource(source)
-		}
+		source.Cfg.SetAuthSource(source)
 	}
 }
 
@@ -178,6 +207,16 @@ func (source *Source) IsSSPI() bool {
 	return source.Type == SSPI
 }
 
+// MustSourceCfg returns the source's config as T. The registry populates Cfg from the
+// source type, so a mismatch is a programming error the caller can't recover from.
+func MustSourceCfg[T Config](source *Source) T {
+	cfg, ok := source.Cfg.(T)
+	if !ok {
+		panic(fmt.Errorf("auth source %q (id=%d, type=%s) has config %T, expected %s", source.Name, source.ID, source.Type, source.Cfg, reflect.TypeFor[T]()))
+	}
+	return cfg
+}
+
 // HasTLS returns true of this source supports TLS.
 func (source *Source) HasTLS() bool {
 	hasTLSer, ok := source.Cfg.(HasTLSer)
@@ -197,21 +236,25 @@ func (source *Source) SkipVerify() bool {
 	return ok && skipVerifiable.IsSkipVerify()
 }
 
+func (source *Source) TwoFactorShouldSkip() bool {
+	return source.TwoFactorPolicy == "skip"
+}
+
 // CreateSource inserts a AuthSource in the DB if not already
 // existing with the given name.
-func CreateSource(source *Source) error {
-	has, err := db.GetEngine(db.DefaultContext).Where("name=?", source.Name).Exist(new(Source))
+func CreateSource(ctx context.Context, source *Source) error {
+	has, err := db.GetEngine(ctx).Where("name=?", source.Name).Exist(new(Source))
 	if err != nil {
 		return err
 	} else if has {
 		return ErrSourceAlreadyExist{source.Name}
 	}
 	// Synchronization is only available with LDAP for now
-	if !source.IsLDAP() {
+	if !source.IsLDAP() && !source.IsOAuth2() {
 		source.IsSyncEnabled = false
 	}
 
-	_, err = db.GetEngine(db.DefaultContext).Insert(source)
+	_, err = db.GetEngine(ctx).Insert(source)
 	if err != nil {
 		return err
 	}
@@ -220,9 +263,7 @@ func CreateSource(source *Source) error {
 		return nil
 	}
 
-	if settable, ok := source.Cfg.(SourceSettable); ok {
-		settable.SetAuthSource(source)
-	}
+	source.Cfg.SetAuthSource(source)
 
 	registerableSource, ok := source.Cfg.(RegisterableSource)
 	if !ok {
@@ -232,62 +273,50 @@ func CreateSource(source *Source) error {
 	err = registerableSource.RegisterSource()
 	if err != nil {
 		// remove the AuthSource in case of errors while registering configuration
-		if _, err := db.GetEngine(db.DefaultContext).Delete(source); err != nil {
+		if _, err := db.GetEngine(ctx).ID(source.ID).Delete(new(Source)); err != nil {
 			log.Error("CreateSource: Error while wrapOpenIDConnectInitializeError: %v", err)
 		}
 	}
 	return err
 }
 
-// Sources returns a slice of all login sources found in DB.
-func Sources() ([]*Source, error) {
-	auths := make([]*Source, 0, 6)
-	return auths, db.GetEngine(db.DefaultContext).Find(&auths)
+type FindSourcesOptions struct {
+	db.ListOptions
+	IsActive  optional.Option[bool]
+	LoginType Type
 }
 
-// SourcesByType returns all sources of the specified type
-func SourcesByType(loginType Type) ([]*Source, error) {
-	sources := make([]*Source, 0, 1)
-	if err := db.GetEngine(db.DefaultContext).Where("type = ?", loginType).Find(&sources); err != nil {
-		return nil, err
-	}
-	return sources, nil
+func (opts FindSourcesOptions) ToOrders() string {
+	return "name"
 }
 
-// AllActiveSources returns all active sources
-func AllActiveSources() ([]*Source, error) {
-	sources := make([]*Source, 0, 5)
-	if err := db.GetEngine(db.DefaultContext).Where("is_active = ?", true).Find(&sources); err != nil {
-		return nil, err
+func (opts FindSourcesOptions) ToConds() builder.Cond {
+	conds := builder.NewCond()
+	if opts.IsActive.Has() {
+		conds = conds.And(builder.Eq{"is_active": opts.IsActive.Value()})
 	}
-	return sources, nil
-}
-
-// ActiveSources returns all active sources of the specified type
-func ActiveSources(tp Type) ([]*Source, error) {
-	sources := make([]*Source, 0, 1)
-	if err := db.GetEngine(db.DefaultContext).Where("is_active = ? and type = ?", true, tp).Find(&sources); err != nil {
-		return nil, err
+	if opts.LoginType != NoType {
+		conds = conds.And(builder.Eq{"`type`": opts.LoginType})
 	}
-	return sources, nil
+	return conds
 }
 
 // IsSSPIEnabled returns true if there is at least one activated login
 // source of type LoginSSPI
-func IsSSPIEnabled() bool {
-	if !db.HasEngine {
-		return false
-	}
-	sources, err := ActiveSources(SSPI)
+func IsSSPIEnabled(ctx context.Context) bool {
+	exist, err := db.Exist[Source](ctx, FindSourcesOptions{
+		IsActive:  optional.Some(true),
+		LoginType: SSPI,
+	}.ToConds())
 	if err != nil {
-		log.Error("ActiveSources: %v", err)
+		log.Error("IsSSPIEnabled: failed to query active SSPI sources: %v", err)
 		return false
 	}
-	return len(sources) > 0
+	return exist
 }
 
 // GetSourceByID returns login source by given ID.
-func GetSourceByID(id int64) (*Source, error) {
+func GetSourceByID(ctx context.Context, id int64) (*Source, error) {
 	source := new(Source)
 	if id == 0 {
 		source.Cfg = registeredConfigs[NoType]()
@@ -297,7 +326,7 @@ func GetSourceByID(id int64) (*Source, error) {
 		return source, nil
 	}
 
-	has, err := db.GetEngine(db.DefaultContext).ID(id).Get(source)
+	has, err := db.GetEngine(ctx).ID(id).Get(source)
 	if err != nil {
 		return nil, err
 	} else if !has {
@@ -307,24 +336,24 @@ func GetSourceByID(id int64) (*Source, error) {
 }
 
 // UpdateSource updates a Source record in DB.
-func UpdateSource(source *Source) error {
+func UpdateSource(ctx context.Context, source *Source) error {
 	var originalSource *Source
 	if source.IsOAuth2() {
 		// keep track of the original values so we can restore in case of errors while registering OAuth2 providers
 		var err error
-		if originalSource, err = GetSourceByID(source.ID); err != nil {
+		if originalSource, err = GetSourceByID(ctx, source.ID); err != nil {
 			return err
 		}
 	}
 
-	has, err := db.GetEngine(db.DefaultContext).Where("name=? AND id!=?", source.Name, source.ID).Exist(new(Source))
+	has, err := db.GetEngine(ctx).Where("name=? AND id!=?", source.Name, source.ID).Exist(new(Source))
 	if err != nil {
 		return err
 	} else if has {
 		return ErrSourceAlreadyExist{source.Name}
 	}
 
-	_, err = db.GetEngine(db.DefaultContext).ID(source.ID).AllCols().Update(source)
+	_, err = db.GetEngine(ctx).ID(source.ID).AllCols().Update(source)
 	if err != nil {
 		return err
 	}
@@ -333,9 +362,7 @@ func UpdateSource(source *Source) error {
 		return nil
 	}
 
-	if settable, ok := source.Cfg.(SourceSettable); ok {
-		settable.SetAuthSource(source)
-	}
+	source.Cfg.SetAuthSource(source)
 
 	registerableSource, ok := source.Cfg.(RegisterableSource)
 	if !ok {
@@ -344,18 +371,12 @@ func UpdateSource(source *Source) error {
 
 	err = registerableSource.RegisterSource()
 	if err != nil {
-		// restore original values since we cannot update the provider it self
-		if _, err := db.GetEngine(db.DefaultContext).ID(source.ID).AllCols().Update(originalSource); err != nil {
+		// restore original values since we cannot update the provider itself
+		if _, err := db.GetEngine(ctx).ID(source.ID).AllCols().Update(originalSource); err != nil {
 			log.Error("UpdateSource: Error while wrapOpenIDConnectInitializeError: %v", err)
 		}
 	}
 	return err
-}
-
-// CountSources returns number of login sources.
-func CountSources() int64 {
-	count, _ := db.GetEngine(db.DefaultContext).Count(new(Source))
-	return count
 }
 
 // ErrSourceNotExist represents a "SourceNotExist" kind of error.
@@ -381,12 +402,6 @@ func (err ErrSourceNotExist) Unwrap() error {
 // ErrSourceAlreadyExist represents a "SourceAlreadyExist" kind of error.
 type ErrSourceAlreadyExist struct {
 	Name string
-}
-
-// IsErrSourceAlreadyExist checks if an error is a ErrSourceAlreadyExist.
-func IsErrSourceAlreadyExist(err error) bool {
-	_, ok := err.(ErrSourceAlreadyExist)
-	return ok
 }
 
 func (err ErrSourceAlreadyExist) Error() string {

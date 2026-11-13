@@ -4,13 +4,16 @@
 package stats
 
 import (
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/modules/graceful"
-	"code.gitea.io/gitea/modules/log"
+	"context"
+
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/log"
 )
 
 // Indexer defines an interface to index repository stats
+// TODO: this indexer is quite different from the others, maybe this package should be moved out from module/indexer
 type Indexer interface {
 	Index(id int64) error
 	Close()
@@ -27,14 +30,14 @@ func Init() error {
 		return err
 	}
 
-	go populateRepoIndexer()
+	go populateRepoIndexer(graceful.GetManager().ShutdownContext())
 
 	return nil
 }
 
 // populateRepoIndexer populate the repo indexer with pre-existing data. This
 // should only be run when the indexer is created for the first time.
-func populateRepoIndexer() {
+func populateRepoIndexer(ctx context.Context) {
 	log.Info("Populating the repo stats indexer with existing repositories")
 
 	isShutdown := graceful.GetManager().IsShutdown()
@@ -61,7 +64,7 @@ func populateRepoIndexer() {
 			return
 		default:
 		}
-		ids, err := repo_model.GetUnindexedRepos(repo_model.RepoIndexerTypeStats, maxRepoID, 0, 50)
+		ids, err := repo_model.GetUnindexedRepos(ctx, repo_model.RepoIndexerTypeStats, maxRepoID, 0, 50)
 		if err != nil {
 			log.Error("populateRepoIndexer: %v", err)
 			return

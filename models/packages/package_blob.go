@@ -5,11 +5,18 @@ package packages
 
 import (
 	"context"
+	"strconv"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/timeutil"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	"gitea.dev/models/perm"
+	"gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
+
+	"xorm.io/builder"
 )
 
 // ErrPackageBlobNotExist indicates a package blob not exist error
@@ -34,14 +41,29 @@ type PackageBlob struct {
 func GetOrInsertBlob(ctx context.Context, pb *PackageBlob) (*PackageBlob, bool, error) {
 	e := db.GetEngine(ctx)
 
-	has, err := e.Get(pb)
+	existing := &PackageBlob{}
+
+	hashCond := builder.Eq{
+		"size":        pb.Size,
+		"hash_md5":    pb.HashMD5,
+		"hash_sha1":   pb.HashSHA1,
+		"hash_sha256": pb.HashSHA256,
+		"hash_sha512": pb.HashSHA512,
+	}
+
+	has, err := e.Where(hashCond).Get(existing)
 	if err != nil {
 		return nil, false, err
 	}
 	if has {
-		return pb, true, nil
+		return existing, true, nil
 	}
 	if _, err = e.Insert(pb); err != nil {
+		// Handle race condition: another request may have inserted the same blob
+		// between our SELECT and INSERT. Retry the SELECT to get the existing blob.
+		if has, _ = e.Where(hashCond).Get(existing); has {
+			return existing, true, nil
+		}
 		return nil, false, err
 	}
 	return pb, false, nil
@@ -97,4 +119,50 @@ func GetTotalUnreferencedBlobSize(ctx context.Context) (int64, error) {
 		Join("LEFT", "package_file", "package_file.blob_id = package_blob.id").
 		Where("package_file.id IS NULL").
 		SumInt(&PackageBlob{}, "size")
+}
+
+// IsBlobAccessibleForUser tests if the user has access to the blob
+func IsBlobAccessibleForUser(ctx context.Context, blobID int64, user *user_model.User) (bool, error) {
+	if user_model.DoerIsSiteAdminFullAccess(user) {
+		return true, nil
+	}
+	ownerVisibilities := []structs.VisibleType{structs.VisibleTypePublic}
+	if !user.IsRestricted {
+		ownerVisibilities = append(ownerVisibilities, structs.VisibleTypeLimited)
+	}
+
+	maxTeamAuthorize := builder.
+		Select("max(team.authorize)").
+		From("team").
+		InnerJoin("team_user", "team_user.team_id = team.id").
+		Where(builder.Eq{"team_user.uid": user.ID}.And(builder.Expr("team_user.org_id = `user`.id")))
+
+	maxTeamUnitAccessMode := builder.
+		Select("max(team_unit.access_mode)").
+		From("team").
+		InnerJoin("team_user", "team_user.team_id = team.id").
+		InnerJoin("team_unit", "team_unit.team_id = team.id").
+		Where(builder.Eq{"team_user.uid": user.ID, "team_unit.type": unit.TypePackages}.And(builder.Expr("team_user.org_id = `user`.id")))
+
+	cond := builder.Eq{"package_blob.id": blobID}.And(
+		// owner = user
+		builder.Eq{"`user`.id": user.ID}.
+			// user can see owner
+			Or(builder.In("`user`.visibility", ownerVisibilities)).
+			// owner is an organization and user has access to it
+			Or(builder.Eq{"`user`.type": user_model.UserTypeOrganization}.
+				And(builder.Lte{strconv.Itoa(int(perm.AccessModeRead)): maxTeamAuthorize}.Or(builder.Lte{strconv.Itoa(int(perm.AccessModeRead)): maxTeamUnitAccessMode}))),
+	)
+	if !user_model.DoerCanViewPrivate(user) {
+		cond = cond.And(builder.Eq{"`user`.visibility": structs.VisibleTypePublic})
+	}
+
+	return db.GetEngine(ctx).
+		Table("package_blob").
+		Join("INNER", "package_file", "package_file.blob_id = package_blob.id").
+		Join("INNER", "package_version", "package_version.id = package_file.version_id").
+		Join("INNER", "package", "package.id = package_version.package_id").
+		Join("INNER", "user", "`user`.id = package.owner_id").
+		Where(cond).
+		Exist(&PackageBlob{})
 }

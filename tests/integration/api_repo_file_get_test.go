@@ -8,25 +8,26 @@ import (
 	"net/url"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/tests"
+	auth_model "gitea.dev/models/auth"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestAPIGetRawFileOrLFS(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
-
-	// Test with raw file
-	req := NewRequest(t, "GET", "/api/v1/repos/user2/repo1/media/README.md")
-	resp := MakeRequest(t, req, http.StatusOK)
-	assert.Equal(t, "# repo1\n\nDescription for repo1", resp.Body.String())
-
-	// Test with LFS
 	onGiteaRun(t, func(t *testing.T, u *url.URL) {
-		httpContext := NewAPITestContext(t, "user2", "repo-lfs-test", auth_model.AccessTokenScopeRepo, auth_model.AccessTokenScopeDeleteRepo)
-		doAPICreateRepository(httpContext, false, func(t *testing.T, repository api.Repository) {
+		// Test with raw file
+		req := NewRequest(t, "GET", "/api/v1/repos/user2/repo1/media/README.md")
+		resp := MakeRequest(t, req, http.StatusOK)
+		assert.Equal(t, "# repo1\n\nDescription for repo1", resp.Body.String())
+
+		req = NewRequest(t, "GET", "/api/v1/repos/user2/repo2/media/test.xml").AddTokenAuth(getUserToken(t, "user2", auth_model.AccessTokenScopeReadRepository))
+		resp = MakeRequest(t, req, http.StatusOK)
+		assert.Equal(t, "text/plain; charset=utf-8", resp.Header().Get("Content-Type"))
+
+		// Test with LFS
+		createLFSTestRepository(t, "repo-lfs-test")
+		httpContext := NewAPITestContext(t, "user2", "repo-lfs-test", auth_model.AccessTokenScopeWriteRepository)
+		t.Run("repo-lfs-test", func(t *testing.T) {
 			u.Path = httpContext.GitPath()
 			dstPath := t.TempDir()
 
@@ -39,13 +40,11 @@ func TestAPIGetRawFileOrLFS(t *testing.T) {
 
 			t.Run("Partial Clone", doPartialGitClone(dstPath2, u))
 
-			lfs, _ := lfsCommitAndPushTest(t, dstPath)
+			lfs := lfsCommitAndPushTest(t, dstPath, testFileSizeSmall)[0]
 
-			reqLFS := NewRequest(t, "GET", "/api/v1/repos/user2/repo1/media/"+lfs)
-			respLFS := MakeRequestNilResponseRecorder(t, reqLFS, http.StatusOK)
-			assert.Equal(t, littleSize, respLFS.Length)
-
-			doAPIDeleteRepository(httpContext)
+			reqLFS := NewRequest(t, "GET", "/api/v1/repos/user2/repo-lfs-test/media/"+lfs).AddTokenAuth(httpContext.Token)
+			respLFS := MakeRequest(t, reqLFS, http.StatusOK)
+			assert.Equal(t, testFileSizeSmall, respLFS.Body.Len())
 		})
 	})
 }

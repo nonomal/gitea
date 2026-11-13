@@ -9,55 +9,49 @@ import (
 	"image/png"
 	"testing"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	"code.gitea.io/gitea/modules/avatar"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/avatar"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestUploadAvatar(t *testing.T) {
-	// Generate image
-	myImage := image.NewRGBA(image.Rect(0, 0, 1, 1))
-	var buff bytes.Buffer
-	png.Encode(&buff, myImage)
+	for _, testCase := range []struct {
+		width        int
+		deleteAvatar bool
+	}{
+		{1, false},
+		{5000, false},
+		{1, true},
+	} {
+		// Generate image
+		var buff bytes.Buffer
+		png.Encode(&buff, image.NewRGBA(image.Rect(0, 0, testCase.width, 1)))
 
-	assert.NoError(t, unittest.PrepareTestDatabase())
-	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 10})
+		assert.NoError(t, unittest.PrepareTestDatabase())
+		repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 10})
 
-	err := UploadAvatar(db.DefaultContext, repo, buff.Bytes())
-	assert.NoError(t, err)
-	assert.Equal(t, avatar.HashAvatar(10, buff.Bytes()), repo.Avatar)
+		err := UploadAvatar(t.Context(), repo, buff.Bytes())
+		if testCase.width == 5000 {
+			assert.Error(t, err)
+			continue
+		}
+		assert.NoError(t, err)
+		if testCase.deleteAvatar {
+			err = DeleteAvatar(t.Context(), repo)
+			assert.NoError(t, err)
+			assert.Empty(t, repo.Avatar)
+		} else {
+			assert.Equal(t, avatar.HashAvatar(10, buff.Bytes()), repo.Avatar)
+		}
+	}
 }
 
-func TestUploadBigAvatar(t *testing.T) {
-	// Generate BIG image
-	myImage := image.NewRGBA(image.Rect(0, 0, 5000, 1))
-	var buff bytes.Buffer
-	png.Encode(&buff, myImage)
-
-	assert.NoError(t, unittest.PrepareTestDatabase())
-	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 10})
-
-	err := UploadAvatar(db.DefaultContext, repo, buff.Bytes())
-	assert.Error(t, err)
-}
-
-func TestDeleteAvatar(t *testing.T) {
-	// Generate image
-	myImage := image.NewRGBA(image.Rect(0, 0, 1, 1))
-	var buff bytes.Buffer
-	png.Encode(&buff, myImage)
-
-	assert.NoError(t, unittest.PrepareTestDatabase())
-	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 10})
-
-	err := UploadAvatar(db.DefaultContext, repo, buff.Bytes())
-	assert.NoError(t, err)
-
-	err = DeleteAvatar(db.DefaultContext, repo)
-	assert.NoError(t, err)
-
-	assert.Equal(t, "", repo.Avatar)
+func TestGenerateAvatar(t *testing.T) {
+	templateRepo := &repo_model.Repository{ID: 10, Avatar: "a"}
+	generateRepo := &repo_model.Repository{ID: 11}
+	_ = generateAvatar(t.Context(), templateRepo, generateRepo)
+	assert.NotEmpty(t, generateRepo.Avatar)
+	assert.NotEqual(t, templateRepo.Avatar, generateRepo.Avatar)
 }

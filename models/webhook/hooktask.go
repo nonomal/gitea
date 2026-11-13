@@ -5,17 +5,32 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"time"
+	"uuid"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	api "code.gitea.io/gitea/modules/structs"
-	webhook_module "code.gitea.io/gitea/modules/webhook"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
+	webhook_module "gitea.dev/modules/webhook"
 
-	gouuid "github.com/google/uuid"
+	"xorm.io/builder"
 )
+
+type ListHookTaskOptions struct {
+	db.ListOptions
+	HookID int64
+}
+
+func (opts ListHookTaskOptions) ToConds() builder.Cond {
+	return builder.Eq{"hook_task.hook_id": opts.HookID}
+}
+
+func (opts ListHookTaskOptions) ToOrders() string {
+	return "hook_task.id DESC"
+}
 
 //   ___ ___                __   ___________              __
 //  /   |   \  ____   ____ |  | _\__    ___/____    _____|  | __
@@ -29,6 +44,7 @@ type HookRequest struct {
 	URL        string            `json:"url"`
 	HTTPMethod string            `json:"http_method"`
 	Headers    map[string]string `json:"headers"`
+	Body       string            `json:"body"`
 }
 
 // HookResponse represents hook task response information.
@@ -40,15 +56,18 @@ type HookResponse struct {
 
 // HookTask represents a hook task.
 type HookTask struct {
-	ID              int64  `xorm:"pk autoincr"`
-	HookID          int64  `xorm:"index"`
-	UUID            string `xorm:"unique"`
-	api.Payloader   `xorm:"-"`
-	PayloadContent  string `xorm:"LONGTEXT"`
-	EventType       webhook_module.HookEventType
-	IsDelivered     bool
-	Delivered       int64
-	DeliveredString string `xorm:"-"`
+	ID             int64  `xorm:"pk autoincr"`
+	HookID         int64  `xorm:"index"`
+	UUID           string `xorm:"unique"`
+	PayloadContent string `xorm:"LONGTEXT"`
+	// PayloadVersion number to allow for smooth version upgrades:
+	//  - PayloadVersion 1: PayloadContent contains the JSON as sent to the URL
+	//  - PayloadVersion 2: PayloadContent contains the original event
+	PayloadVersion int `xorm:"DEFAULT 1"`
+
+	EventType   webhook_module.HookEventType
+	IsDelivered bool
+	Delivered   timeutil.TimeStampNano
 
 	// History info.
 	IsSucceed       bool
@@ -75,8 +94,6 @@ func (t *HookTask) BeforeUpdate() {
 
 // AfterLoad updates the webhook object upon setting a column
 func (t *HookTask) AfterLoad() {
-	t.DeliveredString = time.Unix(0, t.Delivered).Format("2006-01-02 15:04:05 MST")
-
 	if len(t.RequestContent) == 0 {
 		return
 	}
@@ -94,7 +111,7 @@ func (t *HookTask) AfterLoad() {
 	}
 }
 
-func (t *HookTask) simpleMarshalJSON(v interface{}) string {
+func (t *HookTask) simpleMarshalJSON(v any) string {
 	p, err := json.Marshal(v)
 	if err != nil {
 		log.Error("Marshal [%d]: %v", t.ID, err)
@@ -103,24 +120,38 @@ func (t *HookTask) simpleMarshalJSON(v interface{}) string {
 }
 
 // HookTasks returns a list of hook tasks by given conditions.
-func HookTasks(hookID int64, page int) ([]*HookTask, error) {
+func HookTasks(ctx context.Context, hookID int64, page int) ([]*HookTask, error) {
 	tasks := make([]*HookTask, 0, setting.Webhook.PagingNum)
-	return tasks, db.GetEngine(db.DefaultContext).
+	return tasks, db.GetEngine(ctx).
 		Limit(setting.Webhook.PagingNum, (page-1)*setting.Webhook.PagingNum).
 		Where("hook_id=?", hookID).
 		Desc("id").
 		Find(&tasks)
 }
 
+func GetHookTaskByUUID(ctx context.Context, hookID int64, uuid string) (*HookTask, error) {
+	task, exist, err := db.Get[HookTask](ctx, builder.Eq{"hook_id": hookID, "uuid": uuid})
+	if err != nil {
+		return nil, err
+	} else if !exist {
+		return nil, ErrHookTaskNotExist{
+			HookID: hookID,
+			UUID:   uuid,
+		}
+	}
+	return task, nil
+}
+
 // CreateHookTask creates a new hook task,
 // it handles conversion from Payload to PayloadContent.
 func CreateHookTask(ctx context.Context, t *HookTask) (*HookTask, error) {
-	data, err := t.Payloader.JSONPayload()
-	if err != nil {
-		return nil, err
+	t.UUID = uuid.New().String()
+	if t.Delivered == 0 {
+		t.Delivered = timeutil.TimeStampNanoNow()
 	}
-	t.UUID = gouuid.New().String()
-	t.PayloadContent = string(data)
+	if t.PayloadVersion == 0 {
+		return nil, errors.New("missing HookTask.PayloadVersion")
+	}
 	return t, db.Insert(ctx, t)
 }
 
@@ -140,34 +171,24 @@ func GetHookTaskByID(ctx context.Context, id int64) (*HookTask, error) {
 }
 
 // UpdateHookTask updates information of hook task.
-func UpdateHookTask(t *HookTask) error {
-	_, err := db.GetEngine(db.DefaultContext).ID(t.ID).AllCols().Update(t)
+func UpdateHookTask(ctx context.Context, t *HookTask) error {
+	_, err := db.GetEngine(ctx).ID(t.ID).AllCols().Update(t)
 	return err
 }
 
 // ReplayHookTask copies a hook task to get re-delivered
 func ReplayHookTask(ctx context.Context, hookID int64, uuid string) (*HookTask, error) {
-	task := &HookTask{
-		HookID: hookID,
-		UUID:   uuid,
-	}
-	has, err := db.GetByBean(ctx, task)
+	task, err := GetHookTaskByUUID(ctx, hookID, uuid)
 	if err != nil {
 		return nil, err
-	} else if !has {
-		return nil, ErrHookTaskNotExist{
-			HookID: hookID,
-			UUID:   uuid,
-		}
 	}
 
-	newTask := &HookTask{
-		UUID:           gouuid.New().String(),
+	return CreateHookTask(ctx, &HookTask{
 		HookID:         task.HookID,
 		PayloadContent: task.PayloadContent,
 		EventType:      task.EventType,
-	}
-	return newTask, db.Insert(ctx, newTask)
+		PayloadVersion: task.PayloadVersion,
+	})
 }
 
 // FindUndeliveredHookTaskIDs will find the next 100 undelivered hook tasks with ID greater than the provided lowerID
@@ -198,7 +219,8 @@ func MarkTaskDelivered(ctx context.Context, task *HookTask) (bool, error) {
 func CleanupHookTaskTable(ctx context.Context, cleanupType HookTaskCleanupType, olderThan time.Duration, numberToKeep int) error {
 	log.Trace("Doing: CleanupHookTaskTable")
 
-	if cleanupType == OlderThan {
+	switch cleanupType {
+	case OlderThan:
 		deleteOlderThan := time.Now().Add(-olderThan).UnixNano()
 		deletes, err := db.GetEngine(ctx).
 			Where("is_delivered = ? and delivered < ?", true, deleteOlderThan).
@@ -207,7 +229,7 @@ func CleanupHookTaskTable(ctx context.Context, cleanupType HookTaskCleanupType, 
 			return err
 		}
 		log.Trace("Deleted %d rows from hook_task", deletes)
-	} else if cleanupType == PerWebhook {
+	case PerWebhook:
 		hookIDs := make([]int64, 0, 10)
 		err := db.GetEngine(ctx).
 			Table("webhook").

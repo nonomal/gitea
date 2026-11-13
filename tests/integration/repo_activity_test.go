@@ -9,8 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/modules/test"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/test"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -20,18 +22,21 @@ func TestRepoActivity(t *testing.T) {
 		session := loginUser(t, "user1")
 
 		// Create PRs (1 merged & 2 proposed)
-		testRepoFork(t, session, "user2", "repo1", "user1", "repo1")
+		testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
 		testEditFile(t, session, "user1", "repo1", "master", "README.md", "Hello, World (Edited)\n")
-		resp := testPullCreate(t, session, "user1", "repo1", "master", "This is a pull title")
+		resp := testPullCreate(t, session, "user1", "repo1", false, "master", "master", "This is a pull title")
 		elem := strings.Split(test.RedirectURL(resp), "/")
-		assert.EqualValues(t, "pulls", elem[3])
-		testPullMerge(t, session, elem[1], elem[2], elem[4], repo_model.MergeStyleMerge)
+		assert.Equal(t, "pulls", elem[3])
+		testPullMerge(t, session, elem[1], elem[2], elem[4], MergeOptions{
+			Style:        repo_model.MergeStyleMerge,
+			DeleteBranch: false,
+		})
 
 		testEditFileToNewBranch(t, session, "user1", "repo1", "master", "feat/better_readme", "README.md", "Hello, World (Edited Again)\n")
-		testPullCreate(t, session, "user1", "repo1", "feat/better_readme", "This is a pull title")
+		testPullCreate(t, session, "user1", "repo1", false, "master", "feat/better_readme", "This is a pull title")
 
 		testEditFileToNewBranch(t, session, "user1", "repo1", "master", "feat/much_better_readme", "README.md", "Hello, World (Edited More)\n")
-		testPullCreate(t, session, "user1", "repo1", "feat/much_better_readme", "This is a pull title")
+		testPullCreate(t, session, "user1", "repo1", false, "master", "feat/much_better_readme", "This is a pull title")
 
 		// Create issues (3 new issues)
 		testNewIssue(t, session, "user2", "repo1", "Issue 1", "Description 1")
@@ -46,20 +51,26 @@ func TestRepoActivity(t *testing.T) {
 		resp = session.MakeRequest(t, req, http.StatusOK)
 		htmlDoc := NewHTMLParser(t, resp.Body)
 
-		// Should be 1 published release
-		list := htmlDoc.doc.Find("#published-releases").Next().Find("p.desc")
-		assert.Len(t, list.Nodes, 1)
+		for _, section := range []struct {
+			selector string
+			count    int
+		}{
+			{"#published-releases", 1},     // Should be 1 published release
+			{"#merged-pull-requests", 1},   // Should be 1 merged pull request
+			{"#proposed-pull-requests", 2}, // Should be 2 proposed pull requests
+			{"#new-issues", 3},             // Should be 3 new issues
+		} {
+			list := htmlDoc.doc.Find(section.selector).Next().Find("p.desc")
+			assert.Len(t, list.Nodes, section.count)
+		}
 
-		// Should be 1 merged pull request
-		list = htmlDoc.doc.Find("#merged-pull-requests").Next().Find("p.desc")
-		assert.Len(t, list.Nodes, 1)
-
-		// Should be 2 proposed pull requests
-		list = htmlDoc.doc.Find("#proposed-pull-requests").Next().Find("p.desc")
-		assert.Len(t, list.Nodes, 2)
-
-		// Should be 3 new issues
-		list = htmlDoc.doc.Find("#new-issues").Next().Find("p.desc")
-		assert.Len(t, list.Nodes, 3)
+		// Non-existing default branch
+		repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{Name: "repo1"})
+		repo1.DefaultBranch = "no-such-branch"
+		_, _ = db.GetEngine(t.Context()).Cols("default_branch").Update(repo1)
+		req = NewRequest(t, "GET", "/user2/repo1/activity")
+		req.Header.Add("Accept", "text/html")
+		resp = session.MakeRequest(t, req, http.StatusNotFound)
+		assert.Contains(t, resp.Body.String(), `Default branch "no-such-branch" does not exist.`)
 	})
 }

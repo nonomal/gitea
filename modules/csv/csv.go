@@ -7,13 +7,14 @@ import (
 	"bytes"
 	stdcsv "encoding/csv"
 	"io"
-	"path/filepath"
+	"path"
 	"regexp"
 	"strings"
+	"sync"
 
-	"code.gitea.io/gitea/modules/markup"
-	"code.gitea.io/gitea/modules/translation"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/modules/markup"
+	"gitea.dev/modules/translation"
+	"gitea.dev/modules/util"
 )
 
 const (
@@ -30,6 +31,8 @@ func CreateReader(input io.Reader, delimiter rune) *stdcsv.Reader {
 		// thus would change `\t\t` to just `\t` or `  ` (two spaces) to just ` ` (single space)
 		rd.TrimLeadingSpace = true
 	}
+	// Don't force validation of every row to have the same number of entries as the first row.
+	rd.FieldsPerRecord = -1
 	return rd
 }
 
@@ -53,7 +56,7 @@ func CreateReaderAndDetermineDelimiter(ctx *markup.RenderContext, rd io.Reader) 
 func determineDelimiter(ctx *markup.RenderContext, data []byte) rune {
 	extension := ".csv"
 	if ctx != nil {
-		extension = strings.ToLower(filepath.Ext(ctx.RelativePath))
+		extension = strings.ToLower(path.Ext(ctx.RenderOptions.RelativePath))
 	}
 
 	var delimiter rune
@@ -69,15 +72,24 @@ func determineDelimiter(ctx *markup.RenderContext, data []byte) rune {
 	return delimiter
 }
 
-// quoteRegexp follows the RFC-4180 CSV standard for when double-quotes are used to enclose fields, then a double-quote appearing inside a
-// field must be escaped by preceding it with another double quote. https://www.ietf.org/rfc/rfc4180.txt
-// This finds all quoted strings that have escaped quotes.
-var quoteRegexp = regexp.MustCompile(`"[^"]*"`)
+var globalVars = sync.OnceValue(func() (ret struct {
+	quoteRegexp       *regexp.Regexp
+	beforeAfterQuotes *regexp.Regexp
+},
+) {
+	// quoteRegexp follows the RFC-4180 CSV standard for when double-quotes are used to enclose fields, then a double-quote appearing inside a
+	// field must be escaped by preceding it with another double quote. https://www.ietf.org/rfc/rfc4180.txt
+	// This finds all quoted strings that have escaped quotes.
+	ret.quoteRegexp = regexp.MustCompile(`"[^"]*"`)
+	// Looks for possible delimiters right before or after (with spaces after the former) double quotes with closing quotes
+	ret.beforeAfterQuotes = regexp.MustCompile(`([,@\t;|]{0,1}) *(?:"[^"]*")+([,@\t;|]{0,1})`)
+	return ret
+})
 
 // removeQuotedStrings uses the quoteRegexp to remove all quoted strings so that we can reliably have each row on one line
 // (quoted strings often have new lines within the string)
 func removeQuotedString(text string) string {
-	return quoteRegexp.ReplaceAllLiteralString(text, "")
+	return globalVars().quoteRegexp.ReplaceAllLiteralString(text, "")
 }
 
 // guessDelimiter takes up to maxLines of the CSV text, iterates through the possible delimiters, and sees if the CSV Reader reads it without throwing any errors.
@@ -123,21 +135,18 @@ func guessDelimiter(data []byte) rune {
 func FormatError(err error, locale translation.Locale) (string, error) {
 	if perr, ok := err.(*stdcsv.ParseError); ok {
 		if perr.Err == stdcsv.ErrFieldCount {
-			return locale.Tr("repo.error.csv.invalid_field_count", perr.Line), nil
+			return locale.TrString("repo.error.csv.invalid_field_count", perr.Line), nil
 		}
-		return locale.Tr("repo.error.csv.unexpected", perr.Line, perr.Column), nil
+		return locale.TrString("repo.error.csv.unexpected", perr.Line, perr.Column), nil
 	}
 
 	return "", err
 }
 
-// Looks for possible delimiters right before or after (with spaces after the former) double quotes with closing quotes
-var beforeAfterQuotes = regexp.MustCompile(`([,@\t;|]{0,1}) *(?:"[^"]*")+([,@\t;|]{0,1})`)
-
 // guessFromBeforeAfterQuotes guesses the limiter by finding a double quote that has a valid delimiter before it and a closing quote,
 // or a double quote with a closing quote and a valid delimiter after it
 func guessFromBeforeAfterQuotes(data []byte) rune {
-	rs := beforeAfterQuotes.FindStringSubmatch(string(data)) // returns first match, or nil if none
+	rs := globalVars().beforeAfterQuotes.FindStringSubmatch(string(data)) // returns first match, or nil if none
 	if rs != nil {
 		if rs[1] != "" {
 			return rune(rs[1][0]) // delimiter found left of quoted string

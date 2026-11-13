@@ -8,40 +8,55 @@ import (
 	"net/url"
 	"testing"
 
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/tests"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
 
+func TestRepoTopicsPostRejectsCrossOrigin(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+	session := loginUser(t, "user2")
+
+	req := NewRequestWithValues(t, "POST", "/user2/repo1/topics", map[string]string{"topics": "cross"}).
+		SetHeader("Sec-Fetch-Site", "cross-site")
+	session.MakeRequest(t, req, http.StatusForbidden)
+
+	req = NewRequestWithValues(t, "POST", "/user2/repo1/topics", map[string]string{"topics": "same"}).
+		SetHeader("Sec-Fetch-Site", "same-origin")
+	session.MakeRequest(t, req, http.StatusOK)
+}
+
 func TestTopicSearch(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
 	searchURL, _ := url.Parse("/explore/topics/search")
-	var topics struct {
-		TopicNames []*api.TopicResponse `json:"topics"`
-	}
 
-	query := url.Values{"page": []string{"1"}, "limit": []string{"4"}}
-
-	searchURL.RawQuery = query.Encode()
-	res := MakeRequest(t, NewRequest(t, "GET", searchURL.String()), http.StatusOK)
-	DecodeJSON(t, res, &topics)
-	assert.Len(t, topics.TopicNames, 4)
-	assert.EqualValues(t, "6", res.Header().Get("x-total-count"))
-
-	query.Add("q", "topic")
-	searchURL.RawQuery = query.Encode()
-	res = MakeRequest(t, NewRequest(t, "GET", searchURL.String()), http.StatusOK)
-	DecodeJSON(t, res, &topics)
-	assert.Len(t, topics.TopicNames, 2)
-
-	query.Set("q", "database")
-	searchURL.RawQuery = query.Encode()
-	res = MakeRequest(t, NewRequest(t, "GET", searchURL.String()), http.StatusOK)
-	DecodeJSON(t, res, &topics)
-	if assert.Len(t, topics.TopicNames, 1) {
-		assert.EqualValues(t, 2, topics.TopicNames[0].ID)
-		assert.EqualValues(t, "database", topics.TopicNames[0].Name)
-		assert.EqualValues(t, 1, topics.TopicNames[0].RepoCount)
+	for _, testCase := range []struct {
+		query url.Values
+		count int
+	}{
+		// search all topics
+		{nil, 6},
+		// pagination search topics
+		{url.Values{"page": {"1"}, "limit": {"4"}}, 4},
+		// second page
+		{url.Values{"page": {"2"}, "limit": {"4"}}, 2},
+		// add keyword search
+		{url.Values{"page": {"1"}, "limit": {"4"}, "q": {"topic"}}, 2},
+		{url.Values{"page": {"1"}, "limit": {"4"}, "q": {"database"}}, 1},
+	} {
+		searchURL.RawQuery = testCase.query.Encode()
+		res := MakeRequest(t, NewRequest(t, "GET", searchURL.String()), http.StatusOK)
+		topics := DecodeJSON(t, res, &struct {
+			TopicNames []*api.TopicResponse `json:"topics"`
+		}{})
+		if assert.Len(t, topics.TopicNames, testCase.count) && testCase.query.Get("q") == "database" {
+			assert.EqualValues(t, 2, topics.TopicNames[0].ID)
+			assert.Equal(t, "database", topics.TopicNames[0].Name)
+			assert.Equal(t, 1, topics.TopicNames[0].RepoCount)
+		}
+		if testCase.query.Get("q") == "" {
+			assert.Equal(t, "6", res.Header().Get("x-total-count"))
+		}
 	}
 }

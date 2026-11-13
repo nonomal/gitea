@@ -6,15 +6,8 @@ package user
 import (
 	"fmt"
 
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/modules/util"
 )
-
-//  ____ ___
-// |    |   \______ ___________
-// |    |   /  ___// __ \_  __ \
-// |    |  /\___ \\  ___/|  | \/
-// |______//____  >\___  >__|
-//              \/     \/
 
 // ErrUserAlreadyExist represents a "user already exists" error.
 type ErrUserAlreadyExist struct {
@@ -38,9 +31,9 @@ func (err ErrUserAlreadyExist) Unwrap() error {
 
 // ErrUserNotExist represents a "UserNotExist" kind of error.
 type ErrUserNotExist struct {
-	UID   int64
-	Name  string
-	KeyID int64
+	UID      int64
+	Name     string
+	ExtraMsg string
 }
 
 // IsErrUserNotExist checks if an error is a ErrUserNotExist.
@@ -50,7 +43,16 @@ func IsErrUserNotExist(err error) bool {
 }
 
 func (err ErrUserNotExist) Error() string {
-	return fmt.Sprintf("user does not exist [uid: %d, name: %s, keyid: %d]", err.UID, err.Name, err.KeyID)
+	ret := "user does not exist"
+	if err.UID != 0 {
+		ret += fmt.Sprintf(" [id: %d]", err.UID)
+	} else if err.Name != "" {
+		ret += fmt.Sprintf(" [name: %s]", err.Name)
+	}
+	if err.ExtraMsg != "" {
+		ret += ": " + err.ExtraMsg
+	}
+	return ret
 }
 
 // Unwrap unwraps this error as a ErrNotExist error
@@ -79,23 +81,24 @@ func (err ErrUserProhibitLogin) Unwrap() error {
 	return util.ErrPermissionDenied
 }
 
-// ErrUserInactive represents a "ErrUserInactive" kind of error.
-type ErrUserInactive struct {
+// ErrUserIsNotLocal represents a "ErrUserIsNotLocal" kind of error.
+type ErrUserIsNotLocal struct {
 	UID  int64
 	Name string
 }
 
-// IsErrUserInactive checks if an error is a ErrUserInactive
-func IsErrUserInactive(err error) bool {
-	_, ok := err.(ErrUserInactive)
+func (err ErrUserIsNotLocal) Error() string {
+	return fmt.Sprintf("user is not local type [uid: %d, name: %s]", err.UID, err.Name)
+}
+
+// IsErrUserIsNotLocal
+func IsErrUserIsNotLocal(err error) bool {
+	_, ok := err.(ErrUserIsNotLocal)
 	return ok
 }
 
-func (err ErrUserInactive) Error() string {
-	return fmt.Sprintf("user is inactive [uid: %d, name: %s]", err.UID, err.Name)
-}
-
-// Unwrap unwraps this error as a ErrPermission error
-func (err ErrUserInactive) Unwrap() error {
-	return util.ErrPermissionDenied
-}
+var (
+	ErrBotCanNotBeAdmin      = util.NewInvalidArgumentErrorf("bot user can not be a site administrator")
+	ErrBotMustBeLocal        = util.NewInvalidArgumentErrorf("bot user must use local authentication")
+	ErrUserTypeCanNotConvert = util.NewInvalidArgumentErrorf("user type can not be converted")
+)
